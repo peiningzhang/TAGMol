@@ -86,3 +86,24 @@ def str_tuple(argstr):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# %% DFM (Exact Discrete Flow Matching) non-linear time scheduler
+class DFMTimeScheduler:
+    """
+    Non-linear time scheduler for Exact Discrete Flow Matching.
+    kappa_t in [0, 1] with kappa_0=0, kappa_1=1.
+    Uses cosine schedule: kappa_t = (1 - cos(pi*t)) / 2.
+    """
+
+    def kappa(self, t):
+        """Interpolation coefficient kappa_t. t in [0, 1]."""
+        if isinstance(t, torch.Tensor):
+            return (1 - torch.cos(np.pi * t)) / 2
+        return (1 - np.cos(np.pi * t)) / 2
+
+    def d_kappa_dt(self, t):
+        """Derivative d(kappa)/dt."""
+        if isinstance(t, torch.Tensor):
+            return (np.pi / 2) * torch.sin(np.pi * t.clamp(0, 1))
+        return (np.pi / 2) * np.sin(np.pi * np.clip(t, 0, 1))

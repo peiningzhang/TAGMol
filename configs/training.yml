@@ -19,9 +19,9 @@ model:
 
   # Discrete FM attribute parameters (VEDA)
   discrete_prior: uniform  # ['uniform', 'marginal']
-  time_scheduler: log_uniform  # ['log_uniform', 'arcsin', 'edm', 'edm1'] - for VEDA sampling
-  time_scheduler: log_uniform  # ['log_uniform', 'arcsin', 'edm', 'edm1'] - for VEDA sampling
-  time_scheduler: log_uniform  # VEDA sampling: ['log_uniform', 'arcsin', 'edm', 'edm1']
+  # DFM (Exact Discrete Flow Matching) parameters
+  dfm_beta: 0.1  # noise injection for predictor-corrector
+  dfm_num_steps: 100  # N for h=1/N
   beta_start: 1.e-7
   beta_end: 2.e-3
   v_beta_schedule: cosine
