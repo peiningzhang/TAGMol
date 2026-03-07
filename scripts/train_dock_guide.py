@@ -6,6 +6,7 @@ import shutil
 import numpy as np
 import torch
 import torch.utils.tensorboard
+import wandb
 from sklearn.metrics import roc_auc_score
 from torch.nn.utils import clip_grad_norm_
 from torch_geometric.loader import DataLoader
@@ -59,6 +60,16 @@ if __name__ == '__main__':
     os.makedirs(vis_dir, exist_ok=True)
     logger = misc.get_logger('train', log_dir)
     writer = torch.utils.tensorboard.SummaryWriter(log_dir)
+    
+    # Initialize wandb
+    wandb.init(
+        project="tagmol-guide",
+        name=f"{config_name}_{args.tag}" if args.tag else config_name,
+        config=config,
+        dir=log_dir,
+        save_code=True
+    )
+    
     logger.info(args)
     logger.info(config)
     shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
@@ -151,6 +162,14 @@ if __name__ == '__main__':
             writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
             writer.add_scalar('train/grad', orig_grad_norm, it)
             writer.flush()
+            
+            # Log to wandb
+            wandb.log({
+                'iteration': it,
+                'train/loss': avg_loss.item() if torch.is_tensor(avg_loss) else avg_loss,
+                'train/lr': optimizer.param_groups[0]['lr'],
+                'train/grad': orig_grad_norm,
+            })
 
 
     def validate(it):
@@ -195,6 +214,13 @@ if __name__ == '__main__':
         )
         writer.add_scalar('val/loss', avg_loss, it)
         writer.flush()
+        
+        # Log to wandb
+        wandb.log({
+            'iteration': it,
+            'val/loss': avg_loss,
+        })
+        
         return avg_loss
 
 
@@ -218,8 +244,14 @@ if __name__ == '__main__':
                         'scheduler': scheduler.state_dict(),
                         'iteration': it,
                     }, ckpt_path)
+                    
+                    # Log best model to wandb
+                    wandb.run.summary['best_val_loss'] = best_loss
+                    wandb.run.summary['best_iter'] = best_iter
                 else:
                     logger.info(f'[Validate] Val loss is not improved. '
                                 f'Best val loss: {best_loss:.6f} at iter {best_iter}')
     except KeyboardInterrupt:
         logger.info('Terminating...')
+    finally:
+        wandb.finish()

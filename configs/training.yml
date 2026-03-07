@@ -1,7 +1,7 @@
 data:
   name: pl
   path: ./data/crossdocked_v1.1_rmsd1.0_pocket10
-  split: ./data/crossdocked_pocket10_pose_split.pt
+  split: /shared/healthinfolab/phz24002/AliDiff/data/crossdocked_pocket10_pose_split.pt
   transform:
     ligand_atom_mode: add_aromatic
     random_rot: False

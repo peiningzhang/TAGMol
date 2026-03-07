@@ -148,6 +148,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--result_path', type=str, default='./outputs')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Override backbone checkpoint path')
     args = parser.parse_args()
 
     logger = misc.get_logger('sampling')
@@ -159,8 +160,9 @@ if __name__ == '__main__':
 
     device = args.device
 
-    # Load checkpoint
-    ckpt = torch.load(config.model.checkpoint, map_location=device)
+    # Load checkpoint (use --checkpoint if provided, otherwise use config)
+    checkpoint_path = args.checkpoint if args.checkpoint else config.model.checkpoint
+    ckpt = torch.load(checkpoint_path, map_location=device)
     logger.info(f"Training Config: {ckpt['config']}")
 
     # Transforms
@@ -188,7 +190,7 @@ if __name__ == '__main__':
         ligand_atom_feature_dim=ligand_featurizer.feature_dim
     ).to(device)
     model.load_state_dict(ckpt['model'], strict=False if 'train_config' in config.model else True)
-    logger.info(f'Successfully load the model! {config.model.checkpoint}')
+    logger.info(f'Successfully load the model! {checkpoint_path}')
 
     # Guide Transforms
     guide_protein_featurizer = GuideFeaturizeProteinAtom()

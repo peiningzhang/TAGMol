@@ -132,6 +132,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--result_path', type=str, default='./outputs')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Override checkpoint path')
     args = parser.parse_args()
 
     logger = misc.get_logger('sampling')
@@ -141,8 +142,9 @@ if __name__ == '__main__':
     logger.info(config)
     misc.seed_all(config.sample.seed)
 
-    # Load checkpoint
-    ckpt = torch.load(config.model.checkpoint, map_location=args.device)
+    # Load checkpoint (use --checkpoint if provided, otherwise use config)
+    checkpoint_path = args.checkpoint if args.checkpoint else config.model.checkpoint
+    ckpt = torch.load(checkpoint_path, map_location=args.device)
     logger.info(f"Training Config: {ckpt['config']}")
 
     # Transforms
@@ -170,7 +172,7 @@ if __name__ == '__main__':
         ligand_atom_feature_dim=ligand_featurizer.feature_dim
     ).to(args.device)
     model.load_state_dict(ckpt['model'])
-    logger.info(f'Successfully load the model! {config.model.checkpoint}')
+    logger.info(f'Successfully load the model! {checkpoint_path}')
 
     data = test_set[args.data_id]
     pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, pred_pos0_traj, time_list = sample_diffusion_ligand(
