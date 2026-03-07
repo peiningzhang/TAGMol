@@ -1,5 +1,7 @@
 model:
   checkpoint: ./pretrained_models/pretrained_diffusion.pt
+  # VEDA sampling (optional overrides)
+  time_scheduler: log_uniform  # ['log_uniform', 'arcsin', 'edm', 'edm1']
 
 sample:
   seed: 2021
