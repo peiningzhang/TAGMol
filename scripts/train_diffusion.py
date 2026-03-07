@@ -73,16 +73,24 @@ if __name__ == '__main__':
             args.train_report_iter = 50
 
     # Logging
-    log_dir = misc.get_new_log_dir(args.logdir, prefix=config_name, tag=args.tag)
-    ckpt_dir = os.path.join(log_dir, 'checkpoints')
-    os.makedirs(ckpt_dir, exist_ok=True)
-    vis_dir = os.path.join(log_dir, 'vis')
-    os.makedirs(vis_dir, exist_ok=True)
-    logger = misc.get_logger('train', log_dir)
-    writer = torch.utils.tensorboard.SummaryWriter(log_dir)
-    
-    # Initialize wandb (skip if --no_wandb or --trial)
     use_wandb = not args.no_wandb and not args.trial
+
+    if args.trial:
+        # Trial mode: no log dir, use console logger only
+        logger = misc.get_logger('train', log_dir=None)
+        writer = misc.BlackHole()  # Dummy writer
+        ckpt_dir = None
+        log_dir = None
+    else:
+        log_dir = misc.get_new_log_dir(args.logdir, prefix=config_name, tag=args.tag)
+        ckpt_dir = os.path.join(log_dir, 'checkpoints')
+        os.makedirs(ckpt_dir, exist_ok=True)
+        vis_dir = os.path.join(log_dir, 'vis')
+        os.makedirs(vis_dir, exist_ok=True)
+        logger = misc.get_logger('train', log_dir)
+        writer = torch.utils.tensorboard.SummaryWriter(log_dir)
+
+    # Initialize wandb (skip if --no_wandb or --trial)
     if use_wandb:
         wandb.init(
             project="tagmol",
@@ -93,15 +101,17 @@ if __name__ == '__main__':
         )
     else:
         # Create a dummy wandb object to avoid errors in logging code
-        logger.info('[INFO] wandb disabled (trial mode or --no_wandb)')
+        if args.trial:
+            logger.info('[INFO] Trial mode: wandb and file logging disabled')
+        elif args.no_wandb:
+            logger.info('[INFO] wandb disabled (--no_wandb)')
         wandb = misc.BlackHole()
-    
+
     # Trial mode header
     if args.trial:
         logger.info("=" * 60)
         logger.info("TRIAL MODE - Quick Testing")
         logger.info("=" * 60)
-        logger.info(f"Log directory: {log_dir}")
         logger.info(f"Device: {args.device}")
         logger.info(f"Max iterations: {config.train.max_iters}")
         logger.info(f"Batch size: {config.train.batch_size}")
@@ -110,8 +120,10 @@ if __name__ == '__main__':
 
     logger.info(args)
     logger.info(config)
-    shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
-    shutil.copytree('./models', os.path.join(log_dir, 'models'))
+
+    if not args.trial:
+        shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
+        shutil.copytree('./models', os.path.join(log_dir, 'models'))
 
     # Transforms
     protein_featurizer = trans.FeaturizeProteinAtom()
@@ -179,10 +191,18 @@ if __name__ == '__main__':
         for _ in range(config.train.n_acc_batch):
             batch = next(train_iterator).to(args.device)
 
-            # Trial mode: log first batch info
+            # Trial mode: log first batch info and verify kappa-t mapping
             if args.trial and it == 1:
                 logger.info(f'[TRIAL] First batch - protein atoms: {batch.protein_pos.shape[0]}, '
                            f'ligand atoms: {batch.ligand_pos.shape[0]}')
+                # Verify kappa(t) mapping for DFM
+                if hasattr(model, 'dfm_scheduler'):
+                    test_ts = [0.0, 0.25, 0.5, 0.75, 1.0]
+                    logger.info('[TRIAL] Verifying DFM kappa(t) mapping:')
+                    for t_val in test_ts:
+                        kappa = model.dfm_scheduler.kappa(torch.tensor(t_val))
+                        dkappa = model.dfm_scheduler.d_kappa_dt(torch.tensor(t_val))
+                        logger.info(f'[TRIAL]   t={t_val:.2f} -> kappa={kappa:.4f}, d_kappa/dt={dkappa:.4f}')
 
             protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
             gt_protein_pos = batch.protein_pos + protein_noise
@@ -217,11 +237,13 @@ if __name__ == '__main__':
             log_dict = {'iteration': it}
             for k, v in results.items():
                 if torch.is_tensor(v) and v.squeeze().ndim == 0:
-                    writer.add_scalar(f'train/{k}', v, it)
+                    if not args.trial:
+                        writer.add_scalar(f'train/{k}', v, it)
                     log_dict[f'train/{k}'] = v.item()
-            writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
-            writer.add_scalar('train/grad', orig_grad_norm, it)
-            writer.flush()
+            if not args.trial:
+                writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
+                writer.add_scalar('train/grad', orig_grad_norm, it)
+                writer.flush()
 
             # Log to wandb (only if not in trial/no_wandb mode)
             if use_wandb:
@@ -280,26 +302,20 @@ if __name__ == '__main__':
         else:
             scheduler.step()
 
-        # Compute AUROC (skip in trial mode for speed)
-        if not args.trial:
-            atom_auroc = get_auroc(np.concatenate(all_true_v), np.concatenate(all_pred_v, axis=0),
-                                   feat_mode=config.data.transform.ligand_atom_mode)
-            logger.info(
-                '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3 | Avg atom auroc %.6f' % (
-                    it, avg_loss, avg_loss_pos, avg_loss_v * 1000, atom_auroc
-                )
+        # Compute AUROC
+        atom_auroc = get_auroc(np.concatenate(all_true_v), np.concatenate(all_pred_v, axis=0),
+                               feat_mode=config.data.transform.ligand_atom_mode)
+        logger.info(
+            '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3 | Avg atom auroc %.6f' % (
+                it, avg_loss, avg_loss_pos, avg_loss_v * 1000, atom_auroc
             )
-        else:
-            logger.info(
-                '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3' % (
-                    it, avg_loss, avg_loss_pos, avg_loss_v * 1000
-                )
-            )
+        )
 
-        writer.add_scalar('val/loss', avg_loss, it)
-        writer.add_scalar('val/loss_pos', avg_loss_pos, it)
-        writer.add_scalar('val/loss_v', avg_loss_v, it)
-        writer.flush()
+        if not args.trial:
+            writer.add_scalar('val/loss', avg_loss, it)
+            writer.add_scalar('val/loss_pos', avg_loss_pos, it)
+            writer.add_scalar('val/loss_v', avg_loss_v, it)
+            writer.flush()
 
         # Log to wandb (only if not in trial/no_wandb mode)
         if use_wandb:
@@ -308,9 +324,8 @@ if __name__ == '__main__':
                 'val/loss': avg_loss,
                 'val/loss_pos': avg_loss_pos,
                 'val/loss_v': avg_loss_v,
+                'val/atom_auroc': atom_auroc,
             }
-            if not args.trial:
-                log_dict['val/atom_auroc'] = atom_auroc
             wandb.log(log_dict)
 
         return avg_loss
@@ -330,14 +345,17 @@ if __name__ == '__main__':
                 if best_loss is None or val_loss < best_loss:
                     logger.info(f'[Validate] Best val loss achieved: {val_loss:.6f}')
                     best_loss, best_iter = val_loss, it
-                    ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
-                    torch.save({
-                        'config': config,
-                        'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'iteration': it,
-                    }, ckpt_path)
+
+                    # Save checkpoint (skip in trial mode)
+                    if not args.trial:
+                        ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
+                        torch.save({
+                            'config': config,
+                            'model': model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'scheduler': scheduler.state_dict(),
+                            'iteration': it,
+                        }, ckpt_path)
 
                     # Log best model to wandb (only if enabled)
                     if use_wandb:
@@ -354,7 +372,6 @@ if __name__ == '__main__':
             logger.info("TRIAL COMPLETED")
             logger.info(f"Total time: {elapsed/60:.1f} minutes")
             logger.info(f"Best val loss: {best_loss:.6f} at iteration {best_iter}")
-            logger.info(f"Checkpoints saved to: {ckpt_dir}")
             logger.info("=" * 60)
 
     except KeyboardInterrupt:
