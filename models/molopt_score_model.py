@@ -294,10 +294,10 @@ class ScorePosNet3D(nn.Module):
             self.log_alphas_cumprod_v = None
             self.log_one_minus_alphas_cumprod_v = None
             # DFM: non-linear time scheduler (kappa_t, d_kappa_dt)
-            dfm_scheduler_type = getattr(config, 'dfm_scheduler', 'cosine')
-            self.dfm_scheduler = DFMTimeScheduler(scheduler_type=dfm_scheduler_type)
+            self.dfm_scheduler = DFMTimeScheduler()  # kappa(t)=t/(t+1)
             self.dfm_beta = getattr(config, 'dfm_beta', 0.1)  # noise injection for predictor-corrector
             self.dfm_num_steps = getattr(config, 'dfm_num_steps', 100)  # N for h=1/N
+            self.dfm_t_max = getattr(config, 'dfm_t_max', 100.0)  # t in [0, t_max] for kappa(t)=t/(t+1) -> [0,1)
         else:
             # DDPM: atom type diffusion schedule in log space
             if config.v_beta_schedule == 'cosine':
@@ -630,7 +630,9 @@ class ScorePosNet3D(nn.Module):
             # sigma ~ LogNormal for continuous; t ~ Uniform(0,1) for discrete
             u = torch.rand(num_graphs, device=device)
             sigma = (self.sigma_max ** (1 / self.rho) + u * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho
-            t = torch.rand(num_graphs, device=device)
+            # t in [0, dfm_t_max] for kappa(t)=t/(t+1) to cover kappa in [0, ~1)
+            t_max = getattr(self, 'dfm_t_max', 100.0)
+            t = torch.rand(num_graphs, device=device) * t_max
             sigma_per_atom = sigma[batch_ligand].unsqueeze(-1)
             t_per_atom = t[batch_ligand].unsqueeze(-1)
 
@@ -859,9 +861,10 @@ class ScorePosNet3D(nn.Module):
             n_dfm = getattr(self, 'dfm_num_steps', 100)  # N=100 per VEDA_DFM.md
             time_scheduler = getattr(self.config, 'time_scheduler', 'log_uniform')
             sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
-            # DFM integrates from t=0 (uniform) to t=1 (data)
-            t_schedule = torch.linspace(0, 1, n_dfm + 1, device=device)
-            h = 1.0 / n_dfm
+            # DFM: t in [0, t_max] for kappa(t)=t/(t+1), kappa: 0->1 as t: 0->inf
+            t_max = getattr(self, 'dfm_t_max', 100.0)
+            t_schedule = torch.linspace(0, t_max, n_dfm + 1, device=device)
+            h = t_max / n_dfm
             beta = self.dfm_beta
             h_fwd = h * (1 + beta)
             h_bwd = h * beta

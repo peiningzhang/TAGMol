@@ -92,18 +92,18 @@ def count_parameters(model):
 class DFMTimeScheduler:
     """
     Non-linear time scheduler for Exact Discrete Flow Matching.
-    kappa_t in [0, 1] with kappa_0=0, kappa_1=1.
-    Uses cosine schedule: kappa_t = (1 - cos(pi*t)) / 2.
+    kappa(t) = t/(t+1), maps t in [0, +inf) to kappa in [0, 1).
+    kappa_0=0, kappa -> 1 as t -> +inf.
     """
 
     def kappa(self, t):
-        """Interpolation coefficient kappa_t. t in [0, 1]."""
+        """Interpolation coefficient kappa_t = t/(t+1). t in [0, +inf)."""
         if isinstance(t, torch.Tensor):
-            return (1 - torch.cos(np.pi * t)) / 2
-        return (1 - np.cos(np.pi * t)) / 2
+            return t / (t + 1)
+        return t / (t + 1)
 
     def d_kappa_dt(self, t):
-        """Derivative d(kappa)/dt."""
+        """Derivative d(kappa)/dt = 1/(t+1)^2."""
         if isinstance(t, torch.Tensor):
-            return (np.pi / 2) * torch.sin(np.pi * t.clamp(0, 1))
-        return (np.pi / 2) * np.sin(np.pi * np.clip(t, 0, 1))
+            return 1.0 / (t + 1) ** 2
+        return 1.0 / (t + 1) ** 2

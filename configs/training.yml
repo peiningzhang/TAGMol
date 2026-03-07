@@ -22,6 +22,7 @@ model:
   # DFM (Exact Discrete Flow Matching) parameters
   dfm_beta: 0.1  # noise injection for predictor-corrector
   dfm_num_steps: 100  # N for h=1/N
+  dfm_t_max: 100.0  # t in [0, t_max] for kappa(t)=t/(t+1) mapping to [0, 1)
   beta_start: 1.e-7
   beta_end: 2.e-3
   v_beta_schedule: cosine
