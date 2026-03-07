@@ -627,9 +627,15 @@ class ScorePosNet3D(nn.Module):
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + Discrete FM (v) ===
             device = protein_pos.device
-            # sigma ~ LogNormal for continuous; t ~ Uniform(0,1) for discrete
-            u = torch.rand(num_graphs, device=device)
-            sigma = (self.sigma_max ** (1 / self.rho) + u * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho
+            # sigma ~ LogNormal(P_mean, P_std^2) for continuous (EDM training)
+            # Default: P_mean = -1.2, P_std = 1.2 as per EDM paper
+            P_mean = getattr(self, 'edm_p_mean', -1.2)
+            P_std = getattr(self, 'edm_p_std', 1.2)
+            rnd_normal = torch.randn(num_graphs, device=device)
+            sigma = (rnd_normal * P_std + P_mean).exp()
+            # Clamp sigma to [sigma_min, sigma_max] for stability
+            sigma = sigma.clamp(self.sigma_min, self.sigma_max)
+
             # t in [0, dfm_t_max] for kappa(t)=t/(t+1) to cover kappa in [0, ~1)
             t_max = getattr(self, 'dfm_t_max', 100.0)
             t = torch.rand(num_graphs, device=device) * t_max
