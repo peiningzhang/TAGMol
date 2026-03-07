@@ -44,12 +44,33 @@ if __name__ == '__main__':
     parser.add_argument('--logdir', type=str, default='./logs_diffusion')
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--train_report_iter', type=int, default=200)
+    # Trial mode options
+    parser.add_argument('--trial', action='store_true', help='Enable trial mode for quick testing')
+    parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
+    parser.add_argument('--max_iters', type=int, default=None, help='Override max iterations')
+    parser.add_argument('--val_freq', type=int, default=None, help='Override validation frequency')
+    parser.add_argument('--batch_size', type=int, default=None, help='Override batch size')
+    parser.add_argument('--num_workers', type=int, default=None, help='Override num workers')
     args = parser.parse_args()
 
     # Load configs
     config = misc.load_config(args.config)
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     misc.seed_all(config.train.seed)
+
+    # Trial mode: override config
+    if args.trial:
+        if args.max_iters is not None:
+            config.train.max_iters = args.max_iters
+        if args.val_freq is not None:
+            config.train.val_freq = args.val_freq
+        if args.batch_size is not None:
+            config.train.batch_size = args.batch_size
+        if args.num_workers is not None:
+            config.train.num_workers = args.num_workers
+        # Use smaller report interval in trial mode
+        if args.train_report_iter == 200:  # default value
+            args.train_report_iter = 50
 
     # Logging
     log_dir = misc.get_new_log_dir(args.logdir, prefix=config_name, tag=args.tag)
@@ -60,15 +81,33 @@ if __name__ == '__main__':
     logger = misc.get_logger('train', log_dir)
     writer = torch.utils.tensorboard.SummaryWriter(log_dir)
     
-    # Initialize wandb
-    wandb.init(
-        project="tagmol",
-        name=f"{config_name}_{args.tag}" if args.tag else config_name,
-        config=config,
-        dir=log_dir,
-        save_code=True
-    )
+    # Initialize wandb (skip if --no_wandb or --trial)
+    use_wandb = not args.no_wandb and not args.trial
+    if use_wandb:
+        wandb.init(
+            project="tagmol",
+            name=f"{config_name}_{args.tag}" if args.tag else config_name,
+            config=config,
+            dir=log_dir,
+            save_code=True
+        )
+    else:
+        # Create a dummy wandb object to avoid errors in logging code
+        logger.info('[INFO] wandb disabled (trial mode or --no_wandb)')
+        wandb = misc.BlackHole()
     
+    # Trial mode header
+    if args.trial:
+        logger.info("=" * 60)
+        logger.info("TRIAL MODE - Quick Testing")
+        logger.info("=" * 60)
+        logger.info(f"Log directory: {log_dir}")
+        logger.info(f"Device: {args.device}")
+        logger.info(f"Max iterations: {config.train.max_iters}")
+        logger.info(f"Batch size: {config.train.batch_size}")
+        logger.info(f"Workers: {config.train.num_workers}")
+        logger.info("=" * 60)
+
     logger.info(args)
     logger.info(config)
     shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
@@ -94,7 +133,16 @@ if __name__ == '__main__':
         # heavy_only=config.data.heavy_only
     )
     train_set, val_set = subsets['train'], subsets['test']
-    logger.info(f'Training: {len(train_set)} Validation: {len(val_set)}')
+
+    # Trial mode: use subset of data
+    if args.trial:
+        trial_train_size = min(1000, len(train_set))
+        trial_val_size = min(100, len(val_set))
+        train_set = torch.utils.data.Subset(train_set, range(trial_train_size))
+        val_set = torch.utils.data.Subset(val_set, range(trial_val_size))
+        logger.info(f'[TRIAL] Using subset - Training: {len(train_set)}, Validation: {len(val_set)}')
+    else:
+        logger.info(f'Training: {len(train_set)} Validation: {len(val_set)}')
 
     # follow_batch = ['protein_element', 'ligand_element']
     collate_exclude_keys = ['ligand_nbh_list']
@@ -131,6 +179,11 @@ if __name__ == '__main__':
         for _ in range(config.train.n_acc_batch):
             batch = next(train_iterator).to(args.device)
 
+            # Trial mode: log first batch info
+            if args.trial and it == 1:
+                logger.info(f'[TRIAL] First batch - protein atoms: {batch.protein_pos.shape[0]}, '
+                           f'ligand atoms: {batch.ligand_pos.shape[0]}')
+
             protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
             gt_protein_pos = batch.protein_pos + protein_noise
             results = model.get_diffusion_loss(
@@ -154,6 +207,13 @@ if __name__ == '__main__':
                     it, loss, loss_pos, loss_v, optimizer.param_groups[0]['lr'], orig_grad_norm
                 )
             )
+
+            # Trial mode: extra debug info
+            if args.trial and args.device == 'cuda':
+                mem_allocated = torch.cuda.memory_allocated(args.device) / 1e9
+                mem_reserved = torch.cuda.memory_reserved(args.device) / 1e9
+                logger.info(f'[TRIAL] GPU Memory: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB')
+
             log_dict = {'iteration': it}
             for k, v in results.items():
                 if torch.is_tensor(v) and v.squeeze().ndim == 0:
@@ -162,13 +222,14 @@ if __name__ == '__main__':
             writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
             writer.add_scalar('train/grad', orig_grad_norm, it)
             writer.flush()
-            
-            # Log to wandb
-            log_dict.update({
-                'train/lr': optimizer.param_groups[0]['lr'],
-                'train/grad': orig_grad_norm,
-            })
-            wandb.log(log_dict)
+
+            # Log to wandb (only if not in trial/no_wandb mode)
+            if use_wandb:
+                log_dict.update({
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'train/grad': orig_grad_norm,
+                })
+                wandb.log(log_dict)
 
 
     def validate(it):
@@ -177,13 +238,17 @@ if __name__ == '__main__':
         sum_loss_bond, sum_loss_non_bond = 0, 0
         all_pred_v, all_true_v = [], []
         all_pred_bond_type, all_gt_bond_type = [], []
+
+        # Trial mode: use fewer timesteps for faster validation
+        num_val_timesteps = 5 if args.trial else 10
+
         with torch.no_grad():
             model.eval()
-            for batch in tqdm(val_loader, desc='Validate'):
+            for batch in tqdm(val_loader, desc='Validate', disable=not args.trial):
                 batch = batch.to(args.device)
                 batch_size = batch.num_graphs
                 t_loss, t_loss_pos, t_loss_v = [], [], []
-                for t in np.linspace(0, model.num_timesteps - 1, 10).astype(int):
+                for t in np.linspace(0, model.num_timesteps - 1, num_val_timesteps).astype(int):
                     time_step = torch.tensor([t] * batch_size).to(args.device)
                     results = model.get_diffusion_loss(
                         protein_pos=batch.protein_pos,
@@ -207,8 +272,6 @@ if __name__ == '__main__':
         avg_loss = sum_loss / sum_n
         avg_loss_pos = sum_loss_pos / sum_n
         avg_loss_v = sum_loss_v / sum_n
-        atom_auroc = get_auroc(np.concatenate(all_true_v), np.concatenate(all_pred_v, axis=0),
-                               feat_mode=config.data.transform.ligand_atom_mode)
 
         if config.train.scheduler.type == 'plateau':
             scheduler.step(avg_loss)
@@ -217,27 +280,45 @@ if __name__ == '__main__':
         else:
             scheduler.step()
 
-        logger.info(
-            '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3 | Avg atom auroc %.6f' % (
-                it, avg_loss, avg_loss_pos, avg_loss_v * 1000, atom_auroc
+        # Compute AUROC (skip in trial mode for speed)
+        if not args.trial:
+            atom_auroc = get_auroc(np.concatenate(all_true_v), np.concatenate(all_pred_v, axis=0),
+                                   feat_mode=config.data.transform.ligand_atom_mode)
+            logger.info(
+                '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3 | Avg atom auroc %.6f' % (
+                    it, avg_loss, avg_loss_pos, avg_loss_v * 1000, atom_auroc
+                )
             )
-        )
+        else:
+            logger.info(
+                '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3' % (
+                    it, avg_loss, avg_loss_pos, avg_loss_v * 1000
+                )
+            )
+
         writer.add_scalar('val/loss', avg_loss, it)
         writer.add_scalar('val/loss_pos', avg_loss_pos, it)
         writer.add_scalar('val/loss_v', avg_loss_v, it)
         writer.flush()
-        
-        # Log to wandb
-        wandb.log({
-            'iteration': it,
-            'val/loss': avg_loss,
-            'val/loss_pos': avg_loss_pos,
-            'val/loss_v': avg_loss_v,
-            'val/atom_auroc': atom_auroc,
-        })
-        
+
+        # Log to wandb (only if not in trial/no_wandb mode)
+        if use_wandb:
+            log_dict = {
+                'iteration': it,
+                'val/loss': avg_loss,
+                'val/loss_pos': avg_loss_pos,
+                'val/loss_v': avg_loss_v,
+            }
+            if not args.trial:
+                log_dict['val/atom_auroc'] = atom_auroc
+            wandb.log(log_dict)
+
         return avg_loss
 
+
+    # Training loop
+    import time
+    start_time = time.time()
 
     try:
         best_loss, best_iter = None, None
@@ -257,14 +338,27 @@ if __name__ == '__main__':
                         'scheduler': scheduler.state_dict(),
                         'iteration': it,
                     }, ckpt_path)
-                    
-                    # Log best model to wandb
-                    wandb.run.summary['best_val_loss'] = best_loss
-                    wandb.run.summary['best_iter'] = best_iter
+
+                    # Log best model to wandb (only if enabled)
+                    if use_wandb:
+                        wandb.run.summary['best_val_loss'] = best_loss
+                        wandb.run.summary['best_iter'] = best_iter
                 else:
                     logger.info(f'[Validate] Val loss is not improved. '
                                 f'Best val loss: {best_loss:.6f} at iter {best_iter}')
+
+        # Trial mode summary
+        if args.trial:
+            elapsed = time.time() - start_time
+            logger.info("=" * 60)
+            logger.info("TRIAL COMPLETED")
+            logger.info(f"Total time: {elapsed/60:.1f} minutes")
+            logger.info(f"Best val loss: {best_loss:.6f} at iteration {best_iter}")
+            logger.info(f"Checkpoints saved to: {ckpt_dir}")
+            logger.info("=" * 60)
+
     except KeyboardInterrupt:
         logger.info('Terminating...')
     finally:
-        wandb.finish()
+        if use_wandb:
+            wandb.finish()
