@@ -202,6 +202,19 @@ class ScorePosNet3D(nn.Module):
         super().__init__()
         self.config = config
 
+        # Diffusion type: veda (EDM+Discrete FM), edm_fm, or ddpm (legacy)
+        self.diffusion_type = getattr(config, 'diffusion_type', 'ddpm')
+
+        # EDM parameters (VEDA continuous part)
+        self.sigma_data = getattr(config, 'sigma_data', 0.5)
+        self.sigma_min = getattr(config, 'sigma_min', 0.002)
+        self.sigma_max = getattr(config, 'sigma_max', 80.0)
+        self.rho = getattr(config, 'rho', 7.0)
+
+        # Discrete FM prior (VEDA discrete part)
+        discrete_prior = getattr(config, 'discrete_prior', 'uniform')
+        self.discrete_prior = discrete_prior
+
         # variance schedule
         self.model_mean_type = config.model_mean_type  # ['noise', 'C0']
         self.loss_v_weight = config.loss_v_weight
@@ -254,25 +267,47 @@ class ScorePosNet3D(nn.Module):
         self.posterior_var = to_torch_const(posterior_variance)
         self.posterior_logvar = to_torch_const(np.log(np.append(self.posterior_var[1], self.posterior_var[1:])))
 
-        # atom type diffusion schedule in log space
-        if config.v_beta_schedule == 'cosine':
-            alphas_v = cosine_beta_schedule(self.num_timesteps, config.v_beta_s)
-            # print('cosine v alpha schedule applied!')
+        # model definition (num_classes needed for prior_dist)
+        self.hidden_dim = config.hidden_dim
+        self.num_classes = ligand_atom_feature_dim
+
+        # Discrete FM prior (VEDA) or DDPM schedule
+        discrete_prior = getattr(config, 'discrete_prior', 'uniform')
+        if self.diffusion_type == 'veda':
+            # VEDA: Discrete Flow Matching - use prior p_1(v) instead of DDPM schedule
+            if discrete_prior == 'uniform':
+                prior_dist = torch.ones(ligand_atom_feature_dim) / ligand_atom_feature_dim
+            elif discrete_prior == 'marginal':
+                # Marginal: frequency of atom types - requires atom_type_freq from data
+                atom_type_freq = getattr(config, 'atom_type_freq', None)
+                if atom_type_freq is not None:
+                    prior_dist = torch.tensor(atom_type_freq, dtype=torch.float32)
+                    prior_dist = prior_dist / prior_dist.sum()
+                else:
+                    prior_dist = torch.ones(ligand_atom_feature_dim) / ligand_atom_feature_dim
+            else:
+                raise ValueError(f"discrete_prior must be 'uniform' or 'marginal', got {discrete_prior}")
+            self.register_buffer('prior_dist', prior_dist)
+            self.log_alphas_v = None
+            self.log_one_minus_alphas_v = None
+            self.log_alphas_cumprod_v = None
+            self.log_one_minus_alphas_cumprod_v = None
         else:
-            raise NotImplementedError
-        log_alphas_v = np.log(alphas_v)
-        log_alphas_cumprod_v = np.cumsum(log_alphas_v)
-        self.log_alphas_v = to_torch_const(log_alphas_v)
-        self.log_one_minus_alphas_v = to_torch_const(log_1_min_a(log_alphas_v))
-        self.log_alphas_cumprod_v = to_torch_const(log_alphas_cumprod_v)
-        self.log_one_minus_alphas_cumprod_v = to_torch_const(log_1_min_a(log_alphas_cumprod_v))
+            # DDPM: atom type diffusion schedule in log space
+            if config.v_beta_schedule == 'cosine':
+                alphas_v = cosine_beta_schedule(self.num_timesteps, config.v_beta_s)
+            else:
+                raise NotImplementedError
+            log_alphas_v = np.log(alphas_v)
+            log_alphas_cumprod_v = np.cumsum(log_alphas_v)
+            self.log_alphas_v = to_torch_const(log_alphas_v)
+            self.log_one_minus_alphas_v = to_torch_const(log_1_min_a(log_alphas_v))
+            self.log_alphas_cumprod_v = to_torch_const(log_alphas_cumprod_v)
+            self.log_one_minus_alphas_cumprod_v = to_torch_const(log_1_min_a(log_alphas_cumprod_v))
+            self.prior_dist = None
 
         self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
         self.register_buffer('Lt_count', torch.zeros(self.num_timesteps))
-
-        # model definition
-        self.hidden_dim = config.hidden_dim
-        self.num_classes = ligand_atom_feature_dim
         if self.config.node_indicator:
             emb_dim = self.hidden_dim - 1
         else:
@@ -311,8 +346,36 @@ class ScorePosNet3D(nn.Module):
             nn.Linear(self.hidden_dim, ligand_atom_feature_dim),
         )
 
+    def get_edm_scaling(self, sigma):
+        """EDM scaling coefficients: c_skip, c_out, c_in, c_noise (Karras et al.)."""
+        sigma_data = self.sigma_data
+        c_skip = sigma_data ** 2 / (sigma ** 2 + sigma_data ** 2)
+        c_out = sigma * sigma_data / (sigma ** 2 + sigma_data ** 2) ** 0.5
+        c_in = 1 / (sigma ** 2 + sigma_data ** 2) ** 0.5
+        c_noise = torch.log(sigma.clamp(min=1e-12)) / 4
+        return c_skip, c_out, c_in, c_noise
+
+    def sample_discrete_fm_noise(self, v_0, t, batch):
+        """Discrete FM: sample v_t from P(v_t|v_0) = (1-t)*OneHot(v_0) + t*p_1(v)."""
+        device = v_0.device
+        prior = self.prior_dist.to(device)
+        if prior.dim() == 1:
+            prior = prior.unsqueeze(0).expand(len(v_0), -1)
+        prob = (1 - t) * F.one_hot(v_0, self.num_classes).float() + t * prior
+        return torch.distributions.Categorical(prob).sample()
+
+    def get_sigma_schedule(self, num_steps, device, scheduler='log_uniform'):
+        """VEDA: sigma schedule from sigma_max to sigma_min. t: 1 -> 0."""
+        if scheduler == 'log_uniform':
+            # log_uniform: sigma from sigma_max down to sigma_min
+            r = torch.linspace(1, 0, num_steps + 1, device=device)
+            sigma = (self.sigma_max ** (1 / self.rho) + r * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho
+        else:
+            raise NotImplementedError(f"scheduler {scheduler}")
+        return sigma
+
     def forward(self, protein_pos, protein_v, batch_protein, init_ligand_pos, init_ligand_v, batch_ligand,
-                time_step=None, return_all=False, fix_x=False, guide=None):
+                time_step=None, sigma=None, t=None, return_all=False, fix_x=False, guide=None):
         """_summary_
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -337,17 +400,42 @@ class ScorePosNet3D(nn.Module):
 
         batch_size = batch_protein.max().item() + 1
         init_ligand_v = F.one_hot(init_ligand_v, self.num_classes).float()
-        ## time embedding - currently not useful, generally passed as zero only
-        ## if used, it is concatenated to the ligand features
+
+        # VEDA/EDM: scale pos by c_in and use c_noise for time embedding
+        pos_ligand_for_net = init_ligand_pos
+        if sigma is not None:
+            sigma_per_atom = sigma[batch_ligand].unsqueeze(-1)
+            _, _, c_in, c_noise = self.get_edm_scaling(sigma_per_atom)
+            pos_ligand_for_net = c_in * init_ligand_pos
+            time_emb_input = c_noise.squeeze(-1)
+        elif time_step is not None:
+            time_emb_input = time_step
+
+        ## time embedding - c_noise (VEDA) or time_step (DDPM)
         if self.time_emb_dim > 0:
             if self.time_emb_mode == 'simple':
-                input_ligand_feat = torch.cat([
-                    init_ligand_v,
-                    (time_step / self.num_timesteps)[batch_ligand].unsqueeze(-1)
-                ], -1)
+                if time_step is not None:
+                    if time_step.dtype in (torch.long, torch.int):
+                        feat = (time_step.float() / self.num_timesteps)[batch_ligand].unsqueeze(-1)
+                    else:
+                        feat = time_emb_input[batch_ligand].unsqueeze(-1) if time_emb_input.dim() > 0 else time_emb_input.unsqueeze(0).expand(len(batch_ligand), 1)
+                    input_ligand_feat = torch.cat([init_ligand_v, feat], -1)
+                else:
+                    input_ligand_feat = torch.cat([init_ligand_v, torch.zeros(len(init_ligand_v), 1, device=init_ligand_v.device)], -1)
             elif self.time_emb_mode == 'sin':
-                time_feat = self.time_emb(time_step)
-                input_ligand_feat = torch.cat([init_ligand_v, time_feat], -1)
+                if sigma is not None:
+                    time_feat = self.time_emb(time_emb_input)
+                    input_ligand_feat = torch.cat([init_ligand_v, time_feat[batch_ligand]], -1)
+                elif time_step is not None:
+                    if time_step.dtype in (torch.long, torch.int):
+                        t_norm = time_step.float() / self.num_timesteps
+                        time_feat = self.time_emb(t_norm)
+                        input_ligand_feat = torch.cat([init_ligand_v, time_feat[batch_ligand]], -1)
+                    else:
+                        time_feat = self.time_emb(time_step)
+                        input_ligand_feat = torch.cat([init_ligand_v, time_feat[batch_ligand]], -1)
+                else:
+                    input_ligand_feat = torch.cat([init_ligand_v, torch.zeros(len(init_ligand_v), self.time_emb_dim, device=init_ligand_v.device)], -1)
             else:
                 raise NotImplementedError
         else:
@@ -370,7 +458,7 @@ class ScorePosNet3D(nn.Module):
             h_protein=h_protein,
             h_ligand=init_ligand_h,
             pos_protein=protein_pos,
-            pos_ligand=init_ligand_pos,
+            pos_ligand=pos_ligand_for_net,
             batch_protein=batch_protein,
             batch_ligand=batch_ligand,
         )
@@ -526,7 +614,59 @@ class ScorePosNet3D(nn.Module):
         protein_pos, ligand_pos, _ = center_pos(
             protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode)
 
-        # 1. sample noise levels
+        if self.diffusion_type == 'veda':
+            # === VEDA: EDM (pos) + Discrete FM (v) ===
+            device = protein_pos.device
+            # sigma ~ LogNormal for continuous; t ~ Uniform(0,1) for discrete
+            u = torch.rand(num_graphs, device=device)
+            sigma = (self.sigma_max ** (1 / self.rho) + u * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho
+            t = torch.rand(num_graphs, device=device)
+            sigma_per_atom = sigma[batch_ligand].unsqueeze(-1)
+            t_per_atom = t[batch_ligand].unsqueeze(-1)
+
+            # EDM pos noising: pos_t = pos_0 + sigma * eps
+            pos_noise = torch.randn_like(ligand_pos, device=device)
+            ligand_pos_perturbed = ligand_pos + sigma_per_atom * pos_noise
+
+            # Discrete FM noising: P(v_t|v_0) = (1-t)*OneHot(v_0) + t*p_1
+            ligand_v_perturbed = self.sample_discrete_fm_noise(ligand_v, t_per_atom.squeeze(-1), batch_ligand)
+
+            # Forward with sigma and t
+            preds = self(
+                protein_pos=protein_pos,
+                protein_v=protein_v,
+                batch_protein=batch_protein,
+                init_ligand_pos=ligand_pos_perturbed,
+                init_ligand_v=ligand_v_perturbed,
+                batch_ligand=batch_ligand,
+                sigma=sigma,
+                t=t
+            )
+            pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
+
+            # EDM loss: D_theta(pos_t, sigma) - pos_0, weight(sigma) * MSE
+            c_skip, c_out, c_in, c_noise = self.get_edm_scaling(sigma_per_atom)
+            D_theta = c_skip * ligand_pos_perturbed + c_out * pred_ligand_pos
+            error = D_theta - ligand_pos
+            loss_pos = scatter_mean((error ** 2).sum(-1), batch_ligand, dim=0).mean()
+
+            # Discrete FM loss: CrossEntropy(pred_logits, v_0)
+            loss_v = F.cross_entropy(pred_ligand_v, ligand_v, reduction='none')
+            loss_v = scatter_mean(loss_v, batch_ligand, dim=0).mean()
+
+            loss = loss_pos + self.loss_v_weight * loss_v
+            return {
+                'loss_pos': loss_pos,
+                'loss_v': loss_v,
+                'loss': loss,
+                'x0': ligand_pos,
+                'pred_ligand_pos': D_theta,
+                'pred_ligand_v': pred_ligand_v,
+                'pred_pos_noise': pred_ligand_pos,
+                'ligand_v_recon': F.softmax(pred_ligand_v, dim=-1)
+            }
+
+        # === DDPM (legacy) ===
         if time_step is None:
             time_step, pt = self.sample_time(num_graphs, protein_pos.device, self.sample_time_method)
         else:
@@ -603,6 +743,8 @@ class ScorePosNet3D(nn.Module):
     def likelihood_estimation(
             self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, time_step
     ):
+        if self.diffusion_type == 'veda':
+            raise NotImplementedError("Likelihood estimation for VEDA is not yet implemented.")
         protein_pos, ligand_pos, _ = center_pos(
             protein_pos, ligand_pos, batch_protein, batch_ligand, mode='protein')
         assert (time_step == self.num_timesteps).all() or (time_step < self.num_timesteps).all()
@@ -700,7 +842,75 @@ class ScorePosNet3D(nn.Module):
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
         ligand_pos, ligand_v = init_ligand_pos, init_ligand_v
-        ## time sequence - going from 1000 to 1000 - num_steps
+
+        if self.diffusion_type == 'veda':
+            # === VEDA: Heun (pos) + Discrete Euler (v) ===
+            device = protein_pos.device
+            time_scheduler = getattr(self.config, 'time_scheduler', 'log_uniform')
+            sigma_schedule = self.get_sigma_schedule(num_steps, device, time_scheduler)
+            t_schedule = torch.linspace(1, 0, num_steps + 1, device=device)
+
+            for step in tqdm(range(num_steps), desc='sampling', total=num_steps):
+                sigma_i = sigma_schedule[step].expand(num_graphs)
+                sigma_next = sigma_schedule[step + 1].expand(num_graphs)
+                t_i = t_schedule[step].expand(num_graphs)
+                t_next = t_schedule[step + 1].expand(num_graphs)
+
+                preds = self(
+                    protein_pos=protein_pos,
+                    protein_v=protein_v,
+                    batch_protein=batch_protein,
+                    init_ligand_pos=ligand_pos,
+                    init_ligand_v=ligand_v,
+                    batch_ligand=batch_ligand,
+                    sigma=sigma_i,
+                    t=t_i
+                )
+                pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
+
+                # EDM denoiser: D_theta = c_skip * x_t + c_out * F_theta
+                sigma_per_atom = sigma_i[batch_ligand].unsqueeze(-1)
+                c_skip, c_out, _, _ = self.get_edm_scaling(sigma_per_atom)
+                D_theta = c_skip * ligand_pos + c_out * pred_ligand_pos
+
+                # Euler step for pos: d_i = (pos_i - D_theta) / sigma_i, pos_next = pos_i + dt * d_i
+                step_size = (sigma_next - sigma_i)[batch_ligand].unsqueeze(-1)
+                d_i = (ligand_pos - D_theta) / sigma_per_atom.clamp(min=1e-12)
+                ligand_pos = ligand_pos + step_size * d_i
+
+                if not pos_only:
+                    # Discrete FM: p_hat_0 = softmax(logits), P(v_{t-dt}|v_t) via flow
+                    p_hat_0 = F.softmax(pred_ligand_v, dim=-1)
+                    prior = self.prior_dist.to(device).unsqueeze(0).expand(len(ligand_v), -1)
+                    # P(v_{t-dt}|v_0) = (1-(t-dt))*OneHot(v_0) + (t-dt)*prior
+                    # p(v_{t-dt}|v_t) = sum_{v_0} P(v_{t-dt}|v_0) * p_hat(v_0|v_t) / P(v_t|v_0)
+                    t_next_per_atom = t_next[batch_ligand].unsqueeze(-1)
+                    prob_next = (1 - t_next_per_atom) * p_hat_0 + t_next_per_atom * prior
+                    prob_next = prob_next.clamp(min=1e-10)
+                    prob_next = prob_next / prob_next.sum(dim=-1, keepdim=True)
+                    ligand_v = torch.distributions.Categorical(prob_next).sample()
+
+                    v0_pred_traj.append(torch.log(p_hat_0.clamp(min=1e-10)).cpu())
+                    vt_pred_traj.append(torch.log(prob_next.clamp(min=1e-10)).cpu())
+
+                ori_ligand_pos0 = D_theta + offset[batch_ligand]
+                ori_ligand_pos = ligand_pos + offset[batch_ligand]
+                pos0_traj.append(ori_ligand_pos0.clone().cpu())
+                pos_traj.append(ori_ligand_pos.clone().cpu())
+                v_traj.append(ligand_v.clone().cpu())
+
+            ligand_pos = ligand_pos + offset[batch_ligand]
+            return {
+                'pos': ligand_pos,
+                'v': ligand_v,
+                'pos_traj': pos_traj,
+                'pos0_traj': pos0_traj,
+                'v_traj': v_traj,
+                'v0_traj': v0_pred_traj,
+                'vt_traj': vt_pred_traj
+            }
+
+        ## DDPM: time sequence - going from 1000 to 1000 - num_steps
         time_seq = list(reversed(range(self.num_timesteps - num_steps, self.num_timesteps)))
         for i in tqdm(time_seq, desc='sampling', total=len(time_seq)):
             t = torch.full(size=(num_graphs,), fill_value=i, dtype=torch.long, device=protein_pos.device)
@@ -763,6 +973,11 @@ class ScorePosNet3D(nn.Module):
     def sample_guided_diffusion(self, guide_model, gradient_scale_cord, gradient_scale_categ, kind, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
+        if self.diffusion_type == 'veda':
+            raise NotImplementedError(
+                "Guided sampling for VEDA is not yet implemented. Use sample_diffusion for unguided sampling, "
+                "or use diffusion_type='ddpm' for guided sampling."
+            )
         if num_steps is None:
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
@@ -893,7 +1108,15 @@ class ScorePosNet3D(nn.Module):
     def sample_multi_guided_diffusion(self, guide_models, guide_configs, n_data, device, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False):
+        if self.diffusion_type == 'veda':
+            raise NotImplementedError(
+                "Multi-guided sampling for VEDA is not yet implemented. Use sample_diffusion for unguided sampling."
+            )
         assert len(guide_models) == len(guide_configs), f"guide_models and guide_configs must have the same length"
+        if self.diffusion_type == 'veda':
+            raise NotImplementedError(
+                "Multi-guided sampling for VEDA is not yet implemented. Use sample_diffusion for unguided sampling."
+            )
         if num_steps is None:
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
