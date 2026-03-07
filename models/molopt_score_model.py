@@ -627,18 +627,28 @@ class ScorePosNet3D(nn.Module):
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + Discrete FM (v) ===
             device = protein_pos.device
-            # sigma ~ LogNormal(P_mean, P_std^2) for continuous (EDM training)
-            # Default: P_mean = -1.2, P_std = 1.2 as per EDM paper
-            P_mean = getattr(self, 'edm_p_mean', -1.2)
-            P_std = getattr(self, 'edm_p_std', 1.2)
-            rnd_normal = torch.randn(num_graphs, device=device)
-            sigma = (rnd_normal * P_std + P_mean).exp()
-            # Clamp sigma to [sigma_min, sigma_max] for stability
-            sigma = sigma.clamp(self.sigma_min, self.sigma_max)
-
-            # t in [0, dfm_t_max] for kappa(t)=t/(t+1) to cover kappa in [0, ~1)
             t_max = getattr(self, 'dfm_t_max', 100.0)
-            t = torch.rand(num_graphs, device=device) * t_max
+
+            if time_step is None:
+                # Training: random sampling
+                # sigma ~ LogNormal(P_mean, P_std^2)
+                P_mean = getattr(self, 'edm_p_mean', -1.2)
+                P_std = getattr(self, 'edm_p_std', 1.2)
+                rnd_normal = torch.randn(num_graphs, device=device)
+                sigma = (rnd_normal * P_std + P_mean).exp()
+                sigma = sigma.clamp(self.sigma_min, self.sigma_max)
+                # t ~ Uniform(0, t_max)
+                t = torch.rand(num_graphs, device=device) * t_max
+            else:
+                # Validation: fixed grid (log_uniform from sigma_max to sigma_min)
+                # Map timestep to sigma: log_uniform sampling
+                timestep_ratio = time_step.float() / (self.num_timesteps - 1)  # [0, 1]
+                log_sigma_max = torch.log(torch.tensor(self.sigma_max))
+                log_sigma_min = torch.log(torch.tensor(self.sigma_min))
+                log_sigma = log_sigma_max + timestep_ratio * (log_sigma_min - log_sigma_max)
+                sigma = torch.exp(log_sigma)
+                # Map timestep to t: linear from 0 to t_max
+                t = timestep_ratio * t_max
             sigma_per_atom = sigma[batch_ligand].unsqueeze(-1)
             t_per_atom = t[batch_ligand].unsqueeze(-1)
 
