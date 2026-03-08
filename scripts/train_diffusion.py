@@ -195,14 +195,6 @@ if __name__ == '__main__':
             if args.trial and it == 1:
                 logger.info(f'[TRIAL] First batch - protein atoms: {batch.protein_pos.shape[0]}, '
                            f'ligand atoms: {batch.ligand_pos.shape[0]}')
-                # Verify kappa(t) mapping for DFM
-                if hasattr(model, 'dfm_scheduler'):
-                    test_ts = [0.0, 0.25, 0.5, 0.75, 1.0]
-                    logger.info('[TRIAL] Verifying DFM kappa(t) mapping:')
-                    for t_val in test_ts:
-                        kappa = model.dfm_scheduler.kappa(torch.tensor(t_val))
-                        dkappa = model.dfm_scheduler.d_kappa_dt(torch.tensor(t_val))
-                        logger.info(f'[TRIAL]   t={t_val:.2f} -> kappa={kappa:.4f}, d_kappa/dt={dkappa:.4f}')
 
             protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
             gt_protein_pos = batch.protein_pos + protein_noise
@@ -232,7 +224,6 @@ if __name__ == '__main__':
             if args.trial and args.device == 'cuda':
                 mem_allocated = torch.cuda.memory_allocated(args.device) / 1e9
                 mem_reserved = torch.cuda.memory_reserved(args.device) / 1e9
-                logger.info(f'[TRIAL] GPU Memory: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB')
 
             log_dict = {'iteration': it}
             for k, v in results.items():
