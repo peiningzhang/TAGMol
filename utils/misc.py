@@ -92,18 +92,40 @@ def count_parameters(model):
 class DFMTimeScheduler:
     """
     Non-linear time scheduler for Exact Discrete Flow Matching.
-    kappa(t) = t/(t+1), maps t in [0, +inf) to kappa in [0, 1).
-    kappa_0=0, kappa -> 1 as t -> +inf.
+    kappa = sigma / (sigma + sigma_data), maps sigma in [0, +inf) to kappa in [0, 1).
+    kappa_0=0, kappa -> 1 as sigma -> +inf.
     """
 
-    def kappa(self, t):
-        """Interpolation coefficient kappa_t = t/(t+1). t in [0, +inf)."""
-        if isinstance(t, torch.Tensor):
-            return t / (t + 1)
-        return t / (t + 1)
+    def __init__(self, sigma_data=0.5):
+        self.sigma_data = sigma_data
 
-    def d_kappa_dt(self, t):
-        """Derivative d(kappa)/dt = 1/(t+1)^2."""
-        if isinstance(t, torch.Tensor):
-            return 1.0 / (t + 1) ** 2
-        return 1.0 / (t + 1) ** 2
+    # def kappa(self, sigma):
+    #     """Interpolation coefficient kappa = sigma / (sigma + sigma_data)."""
+    #     denom = sigma + self.sigma_data
+    #     if isinstance(sigma, torch.Tensor):
+    #         return sigma / denom
+    #     return sigma / denom
+
+    # def d_kappa_dt(self, sigma):
+    #     """Derivative d(kappa)/d(sigma) = sigma_data / (sigma + sigma_data)^2."""
+    #     denom = (sigma + self.sigma_data) ** 2
+    #     if isinstance(sigma, torch.Tensor):
+    #         return (torch.full_like(sigma, self.sigma_data, dtype=sigma.dtype, device=sigma.device) / denom)
+    #     return self.sigma_data / denom
+    def mask_rate(self, sigma):
+        """Mask rate = sigma / (sigma + sigma_data)."""
+        return sigma / (sigma + self.sigma_data)
+    def kappa(self, sigma):
+        """Interpolation coefficient mask_rate = sigma / (sigma + sigma_data)."""
+
+        mask_rate = sigma / (sigma + self.sigma_data)
+        if isinstance(sigma, torch.Tensor):
+            return (1 - mask_rate)**2
+        return (1 - mask_rate)**2
+
+    def d_kappa_dt(self, sigma):
+        """Derivative d(kappa)/d(sigma) = 2 * (1 - mask_rate) * mask_rate."""
+        mask_rate = sigma / (sigma + self.sigma_data)
+        if isinstance(sigma, torch.Tensor):
+            return 2 * (1 - mask_rate)
+        return 2 * (1 - mask_rate)

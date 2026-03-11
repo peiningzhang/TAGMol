@@ -294,7 +294,7 @@ class ScorePosNet3D(nn.Module):
             self.log_alphas_cumprod_v = None
             self.log_one_minus_alphas_cumprod_v = None
             # DFM: non-linear time scheduler (kappa_t, d_kappa_dt)
-            self.dfm_scheduler = DFMTimeScheduler()  # kappa(t)=t/(t+1)
+            self.dfm_scheduler = DFMTimeScheduler(sigma_data=self.sigma_data)  # kappa = sigma/(sigma+sigma_data)
             self.dfm_beta = getattr(config, 'dfm_beta', 0.1)  # noise injection for predictor-corrector
             self.dfm_num_steps = getattr(config, 'dfm_num_steps', 100)  # N for h=1/N
             self.dfm_t_max = getattr(config, 'dfm_t_max', 100.0)  # t in [0, t_max] for kappa(t)=t/(t+1) -> [0,1)
@@ -361,10 +361,10 @@ class ScorePosNet3D(nn.Module):
         c_noise = torch.log(sigma.clamp(min=1e-12)) / 4
         return c_skip, c_out, c_in, c_noise
 
-    def sample_discrete_dfm_noise(self, v_1, t, batch):
+    def sample_discrete_dfm_noise(self, v_1, sigma, batch):
         """Exact DFM: sample v_t from P(v_t|v_1) = kappa_t * OneHot(v_1) + (1-kappa_t) / S.
         Uses non-linear kappa(t), not linear t."""
-        k_t = self.dfm_scheduler.kappa(t)  # shape (num_graphs,) or (num_atoms,)
+        k_t = self.dfm_scheduler.kappa(sigma)  # shape (num_graphs,) or (num_atoms,)
         if k_t.dim() == 1 and len(k_t) == batch.max().item() + 1:
             k_t = k_t[batch].unsqueeze(-1)  # (num_atoms, 1)
         elif k_t.dim() == 1:
@@ -376,12 +376,20 @@ class ScorePosNet3D(nn.Module):
     def get_sigma_schedule(self, num_steps, device, scheduler='log_uniform'):
         """VEDA: sigma schedule from sigma_max to sigma_min. t: 1 -> 0."""
         if scheduler == 'log_uniform':
-            sigma = torch.linspace(self.sigma_max.log(), self.sigma_min.log(), num_steps + 1, device=device)
+            sigma = torch.linspace(np.log(self.sigma_max), np.log(self.sigma_min), num_steps + 1, device=device)
             sigma = torch.exp(sigma)
         elif scheduler == 'edm':
             # log_uniform: sigma from sigma_max down to sigma_min
             r = torch.linspace(1, 0, num_steps + 1, device=device)
             sigma = (self.sigma_max ** (1 / self.rho) + r * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho
+        elif scheduler == 'arcsin':
+        # Use arcsin-based sigma schedule, as described.
+            transformed = 2 * np.arcsin(np.linspace(0, 1, num_steps + 1)**0.5) / np.pi
+            mixed = (1 - self.rho) * np.linspace(0, 1, num_steps + 1) + self.rho * transformed
+            time_points = mixed * (np.log(self.sigma_max) - np.log(self.sigma_min)) + np.log(self.sigma_min)
+            time_points = np.exp(time_points).tolist()
+            time_points.reverse()
+            sigma = torch.tensor(time_points, device=device, dtype=torch.float32)
         else:
             raise NotImplementedError(f"scheduler {scheduler}")
         return sigma
@@ -409,7 +417,6 @@ class ScorePosNet3D(nn.Module):
             _type_: _description_
         """
 
-        batch_size = batch_protein.max().item() + 1
         init_ligand_v = F.one_hot(init_ligand_v, self.num_classes).float()
 
         # VEDA/EDM: scale pos by c_in and use c_noise for time embedding
@@ -663,7 +670,7 @@ class ScorePosNet3D(nn.Module):
             loss_v = scatter_mean(loss_v, batch_ligand, dim=0).mean()
 
             loss = loss_pos + self.loss_v_weight * loss_v
-            loss = loss /10
+            loss_pos, loss_v, loss = loss_pos /10, loss_v / 10, loss / 10
             return {
                 'loss_pos': loss_pos,
                 'loss_v': loss_v,
@@ -817,6 +824,59 @@ class ScorePosNet3D(nn.Module):
         )
         return preds
 
+    def gat_dfm_step(self, ligand_v, pred_ligand_v, sigma_i, sigma_next, batch_ligand, eps=1e-5):
+        """
+        One discrete DFM (VEDA) update step on ligand_v.
+
+        Args:
+            ligand_v: (N_atoms,) current categorical indices.
+            pred_ligand_v: (N_atoms, S) logits predicted by the network (clean distribution).
+            sigma_i: (num_graphs, 1) current sigma.
+            sigma_next: (num_graphs, 1) next sigma.
+            batch_ligand: (N_atoms,) graph index for each ligand atom.
+            eps: small constant for numerical stability.
+
+        Returns:
+            ligand_v_next: (N_atoms,) updated categorical indices.
+            p_step: (N_atoms, S) updated probability simplex after one Euler step.
+            p_1_given_t: (N_atoms, S) network-predicted clean distribution.
+        """
+        S = self.num_classes
+
+        # 时间调度系数（基于 sigma）
+        kappa_t_graph = self.dfm_scheduler.kappa(sigma_i)
+        d_kappa_t_graph = self.dfm_scheduler.d_kappa_dt(sigma_i)
+        kappa_t = kappa_t_graph[batch_ligand]        # (N_atoms, 1)
+        d_kappa_t = d_kappa_t_graph[batch_ligand]    # (N_atoms, 1)
+
+        mask_rate = self.dfm_scheduler.mask_rate(sigma_i)[batch_ligand]
+        mask_rate_next = self.dfm_scheduler.mask_rate(sigma_next)[batch_ligand]
+
+        # dt 采用 mask_rate 的差值，保证为正
+        dt = (mask_rate - mask_rate_next)
+
+        # 当前状态和网络预测的干净分布
+        X_t = F.one_hot(ligand_v, num_classes=S).float()
+        p_1_given_t = F.softmax(pred_ligand_v, dim=-1)
+
+        # 前向 / 后向概率速度
+        u_fwd = (d_kappa_t / (1.0 - kappa_t).clamp(min=eps)) * (p_1_given_t - X_t)
+        u_bwd = (d_kappa_t / kappa_t.clamp(min=eps)) * (X_t - 1.0 / S)
+
+        # Predictor-Corrector 融合
+        beta = getattr(self.config, 'corrector_weight', 0.1)
+        forward_weight = 1.0 + beta
+        backward_weight = beta
+        pvel = forward_weight * u_fwd - backward_weight * u_bwd
+
+        # Euler 步进并重归一化
+        p_step = X_t + dt * pvel
+        p_step = torch.clamp(p_step, min=1e-9)
+        p_step = p_step / p_step.sum(dim=-1, keepdim=True)
+
+        ligand_v_next = torch.distributions.Categorical(probs=p_step).sample()
+        return ligand_v_next, p_step, p_1_given_t
+
     @torch.no_grad()
     def sample_diffusion(self, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
@@ -849,7 +909,7 @@ class ScorePosNet3D(nn.Module):
 
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
-        ligand_pos, ligand_v = init_ligand_pos, init_ligand_v
+        ligand_pos, ligand_v = init_ligand_pos*self.sigma_max, init_ligand_v
 
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + Exact DFM with Predictor-Corrector (v) ===
@@ -865,11 +925,9 @@ class ScorePosNet3D(nn.Module):
             eps = 1e-5
 
             for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
-                sigma_i = sigma_schedule[step].expand(num_graphs)
-                sigma_next = sigma_schedule[step + 1].expand(num_graphs)
-                h = self.dfm_scheduler.kappa(sigma_i) - self.dfm_scheduler.kappa(sigma_next)
-                h_fwd = h * (1 + beta)
-                h_bwd = h * beta
+                sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
+                sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)
+
 
                 preds = self(
                     protein_pos=protein_pos,
@@ -878,73 +936,90 @@ class ScorePosNet3D(nn.Module):
                     init_ligand_pos=ligand_pos,
                     init_ligand_v=ligand_v,
                     batch_ligand=batch_ligand,
-                    sigma=sigma_i,
-                    t=sigma_i
+                    sigma=sigma_i
                 )
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
                 # EDM denoiser: D_theta = c_skip * x_t + c_out * F_theta
-                sigma_per_atom = sigma_i[batch_ligand].unsqueeze(-1)
+                sigma_per_atom = sigma_i[batch_ligand]
+                sigma_next_per_atom = sigma_next[batch_ligand]
                 c_skip, c_out, _, _ = self.get_edm_scaling(sigma_per_atom)
                 D_theta = c_skip * ligand_pos + c_out * pred_ligand_pos
 
                 # Euler step for pos: d_i = (pos_i - D_theta) / sigma_i, pos_next = pos_i + dt * d_i
-                step_size = (sigma_next - sigma_i)[batch_ligand].unsqueeze(-1)
+                step_size = (sigma_next_per_atom - sigma_per_atom) # step_size is negative
                 d_i = (ligand_pos - D_theta) / sigma_per_atom.clamp(min=1e-12)
                 ligand_pos = ligand_pos + step_size * d_i
-
                 if not pos_only:
-                    # Exact DFM: Predictor-Corrector (mandatory)
-                    kappa_t = self.dfm_scheduler.kappa(sigma_i)
-                    d_kappa_t = self.dfm_scheduler.d_kappa_dt(sigma_i)
-                    if kappa_t.dim() == 1:
-                        kappa_t = kappa_t[batch_ligand].unsqueeze(-1)
-                        d_kappa_t = d_kappa_t[batch_ligand].unsqueeze(-1)
-                    p_hat_0 = F.softmax(pred_ligand_v, dim=-1)
+                    # 获取时间调度系数
+                    kappa_t_graph = self.dfm_scheduler.kappa(sigma_i)
+                    d_kappa_t_graph = self.dfm_scheduler.d_kappa_dt(sigma_i)
+                    kappa_t = kappa_t_graph[batch_ligand]        # (N_atoms, 1)
+                    d_kappa_t = d_kappa_t_graph[batch_ligand]    # (N_atoms, 1)
+                    mask_rate = self.dfm_scheduler.mask_rate(sigma_i)[batch_ligand]
+                    mask_rate_next = self.dfm_scheduler.mask_rate(sigma_next)[batch_ligand]
 
-                    # Phase A: Predictor step - P_jump^fwd(v_t -> y) = h_fwd * (d_kappa*(S-1))/(1-kappa+eps) * p_hat(y)
-                    denom_fwd = (1 - kappa_t).clamp(min=eps)
-                    jump_fwd = h_fwd * (d_kappa_t * (S - 1) / denom_fwd) * p_hat_0
-                    jump_fwd = jump_fwd.clone()
-                    jump_fwd.scatter_(1, ligand_v.unsqueeze(1), 0.0)  # mask y=v_t to 0
-                    stay_fwd = 1.0 - jump_fwd.sum(dim=-1, keepdim=True)
-                    if (stay_fwd < 0).any():
-                        # Scale down jump probs so P_stay >= 0 (per VEDA_DFM.md)
-                        scale = 1.0 / jump_fwd.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-                        jump_fwd = jump_fwd * scale
-                    stay_fwd = (1.0 - jump_fwd.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-                    prob_fwd = jump_fwd.clone()
-                    prob_fwd.scatter_(1, ligand_v.unsqueeze(1), stay_fwd)
-                    prob_fwd = prob_fwd.clamp(min=1e-10)
-                    prob_fwd = prob_fwd / prob_fwd.sum(dim=-1, keepdim=True)
-                    v_prime = torch.distributions.Categorical(prob_fwd).sample()
+                    # dt = kappa_t - kappa_next
+                    dt = (mask_rate - mask_rate_next)
+                    #dt is the time step size, is positive
+                    # 1. 准备当前状态的 One-hot 编码 和 网络预测的干净数据分布
+                    X_t = F.one_hot(ligand_v, num_classes=S).float()
+                    p_1_given_t = F.softmax(pred_ligand_v, dim=-1)
 
-                    # Phase B: Corrector step - P_jump^bwd(v' -> y) = h_bwd * (d_kappa/(kappa+eps)) * (1/S)
-                    denom_bwd = kappa_t.clamp(min=eps)
-                    jump_bwd = h_bwd * (d_kappa_t / denom_bwd) * (1.0 / S)
-                    jump_bwd = jump_bwd.expand(-1, S)
-                    jump_bwd = jump_bwd.clone()
-                    jump_bwd.scatter_(1, v_prime.unsqueeze(1), 0.0)  # mask y=v' to 0
-                    stay_bwd = 1.0 - jump_bwd.sum(dim=-1, keepdim=True)
-                    if (stay_bwd < 0).any():
-                        scale = 1.0 / jump_bwd.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-                        jump_bwd = jump_bwd * scale
-                    stay_bwd = (1.0 - jump_bwd.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-                    prob_bwd = jump_bwd.clone()
-                    prob_bwd.scatter_(1, v_prime.unsqueeze(1), stay_bwd)
-                    prob_bwd = prob_bwd.clamp(min=1e-10)
-                    prob_bwd = prob_bwd / prob_bwd.sum(dim=-1, keepdim=True)
-                    ligand_v = torch.distributions.Categorical(prob_bwd).sample()
+                    # 2. 计算前向概率速度 (指向网络的预测分布)
+                    u_fwd = (d_kappa_t / (1.0 - kappa_t).clamp(min=eps)) * (p_1_given_t - X_t)
 
-                    v0_pred_traj.append(torch.log(p_hat_0.clamp(min=1e-10)).cpu())
-                    vt_pred_traj.append(torch.log(prob_bwd.clamp(min=1e-10)).cpu())
+                    # 3. 计算后向概率速度 (指向纯噪声的均匀分布 1/S)
+                    # 注意：这是 VEDA 与你找的代码最大的区别，用 1.0/S 代替了 delta_mask
+                    u_bwd = (d_kappa_t / kappa_t.clamp(min=eps)) * (X_t - 1.0 / S)
 
+                    # 4. 组合概率速度 (Predictor-Corrector 融合)
+                    # 假设 config.corrector_weight = 0.1 (即 beta_t)
+                    beta = getattr(self.config, 'corrector_weight', 0.1)
+                    forward_weight = 1.0 + beta
+                    backward_weight = beta
+                    
+                    pvel = forward_weight * u_fwd - backward_weight * u_bwd
+
+                    # 5. 在概率单纯形上执行 Euler 步进
+                    # dt = sigma_{i+1} - sigma_i 的时间映射差值，或者简单固定为 1/N
+                    p_step = X_t + dt * pvel
+
+                    # 6. 安全截断与重归一化 (比原版的单纯 clamp 1e-9 更安全严谨)
+                    p_step = torch.clamp(p_step, min=1e-9)
+                    p_step = p_step / p_step.sum(dim=-1, keepdim=True)
+
+                    # 7. 一次性完成采样
+                    ligand_v = torch.distributions.Categorical(probs=p_step).sample()
+                    ###TEMP,TODO: remove thisd
+                    ligand_v = torch.distributions.Categorical(probs=F.softmax(pred_ligand_v, dim=-1)).sample()
+
+                    v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
+                    vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
+
+
+
+                if step in [0, n_dfm//2, n_dfm-1] and (ligand_pos.shape[0] > 0):
+                    with torch.no_grad():
+                        sigma_scalar = sigma_schedule[step].item()
+                        logger = getattr(self, '_debug_logger', None)
+                        if logger is None:
+                            import utils.misc as misc
+                            self._debug_logger = misc.get_logger('veda_sample_debug')
+                            logger = self._debug_logger
+                        logger.info(
+                            f"[VEDA] step {step}/{n_dfm}, "
+                            f"sigma={sigma_scalar:.4e}, "
+                            f"pos_norm_mean={ligand_pos.norm(dim=-1).mean().item():.3f}, "
+                            f"pos_norm_max={ligand_pos.norm(dim=-1).max().item():.3f}"
+                        )
                 ori_ligand_pos0 = D_theta + offset[batch_ligand]
                 ori_ligand_pos = ligand_pos + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
                 pos_traj.append(ori_ligand_pos.clone().cpu())
                 v_traj.append(ligand_v.clone().cpu())
-
+            ligand_pos = D_theta
+            ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
             ligand_pos = ligand_pos + offset[batch_ligand]
             return {
                 'pos': ligand_pos,

@@ -43,6 +43,7 @@ if __name__ == '__main__':
     parser.add_argument('--atom_enc_mode', type=str, default='add_aromatic')
     parser.add_argument('--docking_mode', type=str, choices=['qvina', 'vina_score', 'vina_dock', 'none'])
     parser.add_argument('--exhaustiveness', type=int, default=16)
+    parser.add_argument('--one_line', action='store_true', help='Print all metrics in one line at the end (no ring size)')
     args = parser.parse_args()
 
     result_path = os.path.join(args.sample_path, 'eval_results')
@@ -150,7 +151,7 @@ if __name__ == '__main__':
     logger.info(f'Evaluate done! {num_samples} samples in total.')
 
     fraction_mol_stable = all_mol_stable / num_samples
-    fraction_atm_stable = all_atom_stable / all_n_atom
+    fraction_atm_stable = all_atom_stable / all_n_atom if all_n_atom > 0 else 0.0
     fraction_recon = n_recon_success / num_samples
     fraction_eval = n_eval_success / num_samples
     fraction_complete = n_complete / num_samples
@@ -169,11 +170,19 @@ if __name__ == '__main__':
     print_dict(c_bond_length_dict, logger)
 
     success_pair_length_profile = eval_bond_length.get_pair_length_profile(success_pair_dist)
-    success_js_metrics = eval_bond_length.eval_pair_length_profile(success_pair_length_profile)
-    print_dict(success_js_metrics, logger)
+    if len(success_pair_dist) > 0:
+        success_js_metrics = eval_bond_length.eval_pair_length_profile(success_pair_length_profile)
+        print_dict(success_js_metrics, logger)
+    else:
+        success_js_metrics = {}
+        logger.info('No successful pair distances; skip pair-length JS metrics.')
 
-    atom_type_js = eval_atom_type.eval_atom_type_distribution(success_atom_types)
-    logger.info('Atom type JS: %.4f' % atom_type_js)
+    if sum(success_atom_types.values()) > 0:
+        atom_type_js = eval_atom_type.eval_atom_type_distribution(success_atom_types)
+        logger.info('Atom type JS: %.4f' % atom_type_js)
+    else:
+        atom_type_js = None
+        logger.info('Atom type JS: None (no evaluated molecules)')
 
     if args.save:
         eval_bond_length.plot_distance_hist(success_pair_length_profile,
@@ -185,8 +194,12 @@ if __name__ == '__main__':
 
     qed = [r['chem_results']['qed'] for r in results]
     sa = [r['chem_results']['sa'] for r in results]
-    logger.info('QED:   Mean: %.3f Median: %.3f' % (np.mean(qed), np.median(qed)))
-    logger.info('SA:    Mean: %.3f Median: %.3f' % (np.mean(sa), np.median(sa)))
+    if len(qed) > 0:
+        logger.info('QED:   Mean: %.3f Median: %.3f' % (np.mean(qed), np.median(qed)))
+        logger.info('SA:    Mean: %.3f Median: %.3f' % (np.mean(sa), np.median(sa)))
+    else:
+        logger.info('QED:   Mean: None Median: None')
+        logger.info('SA:    Mean: None Median: None')
     if args.docking_mode == 'qvina':
         vina = [r['vina'][0]['affinity'] for r in results]
         logger.info('Vina:  Mean: %.3f Median: %.3f' % (np.mean(vina), np.median(vina)))
@@ -199,8 +212,55 @@ if __name__ == '__main__':
             vina_dock = [r['vina']['dock'][0]['affinity'] for r in results]
             logger.info('Vina Dock :  Mean: %.3f Median: %.3f' % (np.mean(vina_dock), np.median(vina_dock)))
 
-    # check ring distribution
-    print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
+    # check ring distribution (optional)
+    if not args.one_line:
+        print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
+
+    if args.one_line:
+        def _fmt(v):
+            if v is None:
+                return 'N/A'
+            if isinstance(v, float):
+                return '%.4f' % v
+            return str(v)
+        names, values = [], []
+        for name, val in [
+            ('mol_stable', fraction_mol_stable),
+            ('atm_stable', fraction_atm_stable),
+            ('recon_success', fraction_recon),
+            ('eval_success', fraction_eval),
+            ('complete', fraction_complete),
+        ]:
+            names.append(name)
+            values.append(_fmt(val))
+        for k, v in sorted(c_bond_length_dict.items()):
+            names.append(k)
+            values.append(_fmt(v))
+        for k, v in sorted(success_js_metrics.items()):
+            names.append(k)
+            values.append(_fmt(v))
+        names.append('atom_type_js')
+        values.append(_fmt(atom_type_js))
+        names.extend(['n_recon', 'n_complete', 'n_eval'])
+        values.extend([str(n_recon_success), str(n_complete), str(len(results))])
+        names.extend(['QED_mean', 'QED_med', 'SA_mean', 'SA_med'])
+        values.extend([
+            _fmt(np.mean(qed) if qed else None),
+            _fmt(np.median(qed) if qed else None),
+            _fmt(np.mean(sa) if sa else None),
+            _fmt(np.median(sa) if sa else None),
+        ])
+        if args.docking_mode == 'qvina' and results:
+            vina = [r['vina'][0]['affinity'] for r in results]
+            names.extend(['Vina_mean', 'Vina_med'])
+            values.extend([_fmt(np.mean(vina)), _fmt(np.median(vina))])
+        elif args.docking_mode in ['vina_dock', 'vina_score'] and results:
+            vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
+            vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
+            names.extend(['Vina_score_mean', 'Vina_min_mean'])
+            values.extend([_fmt(np.mean(vina_score_only)), _fmt(np.mean(vina_min))])
+        logger.info('METRICS_ONE_LINE_HEAD\t' + '\t'.join(names))
+        logger.info('METRICS_ONE_LINE_VAL\t' + '\t'.join(values))
 
     if args.save:
         torch.save({
