@@ -13,14 +13,14 @@ model:
 
   # EDM coordinate parameters (VEDA)
   sigma_data: 2
-  sigma_min: 0.008
-  sigma_max: 320
-  rho: 7.0
+  sigma_min: 0.002
+  sigma_max: 160
+  rho: 2.0
 
   # EDM sigma sampling parameters (training only)
   # sigma ~ LogNormal(P_mean, P_std^2) as per EDM paper
-  edm_p_mean: 0   # mean in log-space
-  edm_p_std: 1.2     # std in log-space
+  edm_p_mean: -0.57   # mean in log-space
+  edm_p_std: 1.41     # std in log-space
 
   # Discrete FM attribute parameters (VEDA)
   discrete_prior: uniform  # ['uniform', 'marginal']
@@ -33,7 +33,7 @@ model:
   v_beta_schedule: cosine
   v_beta_s: 0.01
   num_diffusion_timesteps: 1000
-  loss_v_weight: 1.
+  loss_v_weight: 10.
   sample_time_method: symmetric  # ['importance', 'symmetric']
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM
@@ -77,7 +77,7 @@ train:
   bond_loss_weight: 1.0
   optimizer:
     type: adam
-    lr: 0.0003 #5.e-4
+    lr: 0.001 #5.e-4
     weight_decay: 0
     beta1: 0.95
     beta2: 0.999
@@ -85,4 +85,4 @@ train:
     type: plateau
     factor: 0.6
     patience: 10
-    min_lr: 3.e-7
+    min_lr: 1.e-6
