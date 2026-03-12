@@ -32,6 +32,137 @@ def print_ring_ratio(all_ring_sizes, logger):
         logger.info(f'ring size: {ring_size} ratio: {n_mol / len(all_ring_sizes):.3f}')
 
 
+def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mode='none',
+                   protein_root='./data/crossdocked_v1.1_rmsd1.0', atom_enc_mode='add_aromatic',
+                   verbose=False, save=True, exhaustiveness=16, logger=None):
+    """
+    Run full evaluation on generated samples in sample_path. Returns a flat dict of metrics
+    suitable for logging (e.g. wandb). Can be called from train_diffusion for periodic eval.
+    """
+    result_path = os.path.join(sample_path, 'eval_results')
+    os.makedirs(result_path, exist_ok=True)
+    if logger is None:
+        logger = misc.get_logger('evaluate', log_dir=result_path)
+    if not verbose:
+        RDLogger.DisableLog('rdApp.*')
+
+    results_fn_list = glob(os.path.join(sample_path, '*result_*.pt'))
+    results_fn_list = sorted(results_fn_list, key=lambda x: int(os.path.basename(x)[:-3].split('_')[-1]))
+    if eval_num_examples is not None:
+        results_fn_list = results_fn_list[:eval_num_examples]
+    num_examples = len(results_fn_list)
+
+    num_samples = 0
+    all_mol_stable, all_atom_stable, all_n_atom = 0, 0, 0
+    n_recon_success, n_eval_success, n_complete = 0, 0, 0
+    results = []
+    all_pair_dist, all_bond_dist = [], []
+    success_pair_dist, success_atom_types = [], Counter()
+    for example_idx, r_name in enumerate(tqdm(results_fn_list, desc='Eval')):
+        r = torch.load(r_name)
+        all_pred_ligand_pos = r['pred_ligand_pos_traj']
+        all_pred_ligand_v = r['pred_ligand_v_traj']
+        num_samples += len(all_pred_ligand_pos)
+        for sample_idx, (pred_pos, pred_v) in enumerate(zip(all_pred_ligand_pos, all_pred_ligand_v)):
+            pred_pos, pred_v = pred_pos[eval_step], pred_v[eval_step]
+            pred_atom_type = transforms.get_atomic_number_from_index(pred_v, mode=atom_enc_mode)
+            r_stable = analyze.check_stability(pred_pos, pred_atom_type)
+            all_mol_stable += r_stable[0]
+            all_atom_stable += r_stable[1]
+            all_n_atom += r_stable[2]
+            pair_dist = eval_bond_length.pair_distance_from_pos_v(pred_pos, pred_atom_type)
+            all_pair_dist += pair_dist
+            try:
+                pred_aromatic = transforms.is_aromatic_from_index(pred_v, mode=atom_enc_mode)
+                mol = reconstruct.reconstruct_from_generated(pred_pos, pred_atom_type, pred_aromatic)
+                smiles = Chem.MolToSmiles(mol)
+            except reconstruct.MolReconsError:
+                continue
+            n_recon_success += 1
+            if '.' in smiles:
+                continue
+            n_complete += 1
+            try:
+                chem_results = scoring_func.get_chem(mol)
+                if docking_mode == 'qvina':
+                    vina_task = QVinaDockingTask.from_generated_mol(
+                        mol, r['data'].ligand_filename, protein_root=protein_root)
+                    vina_results = vina_task.run_sync()
+                elif docking_mode in ['vina_score', 'vina_dock']:
+                    vina_task = VinaDockingTask.from_generated_mol(
+                        mol, r['data'].ligand_filename, protein_root=protein_root)
+                    score_only_results = vina_task.run(mode='score_only', exhaustiveness=exhaustiveness)
+                    minimize_results = vina_task.run(mode='minimize', exhaustiveness=exhaustiveness)
+                    vina_results = {'score_only': score_only_results, 'minimize': minimize_results}
+                    if docking_mode == 'vina_dock':
+                        docking_results = vina_task.run(mode='dock', exhaustiveness=exhaustiveness)
+                        vina_results['dock'] = docking_results
+                else:
+                    vina_results = None
+                n_eval_success += 1
+            except Exception:
+                continue
+            bond_dist = eval_bond_length.bond_distance_from_mol(mol)
+            all_bond_dist += bond_dist
+            success_pair_dist += pair_dist
+            success_atom_types += Counter(pred_atom_type)
+            results.append({'mol': mol, 'smiles': smiles, 'chem_results': chem_results, 'vina': vina_results})
+
+    fraction_mol_stable = all_mol_stable / num_samples if num_samples else 0.0
+    fraction_atm_stable = all_atom_stable / all_n_atom if all_n_atom > 0 else 0.0
+    fraction_recon = n_recon_success / num_samples if num_samples else 0.0
+    fraction_eval = n_eval_success / num_samples if num_samples else 0.0
+    fraction_complete = n_complete / num_samples if num_samples else 0.0
+
+    c_bond_length_profile = eval_bond_length.get_bond_length_profile(all_bond_dist)
+    c_bond_length_dict = eval_bond_length.eval_bond_length_profile(c_bond_length_profile)
+    if len(success_pair_dist) > 0:
+        success_pair_length_profile = eval_bond_length.get_pair_length_profile(success_pair_dist)
+        success_js_metrics = eval_bond_length.eval_pair_length_profile(success_pair_length_profile)
+    else:
+        success_js_metrics = {}
+        success_pair_length_profile = None
+    atom_type_js = eval_atom_type.eval_atom_type_distribution(success_atom_types) if sum(success_atom_types.values()) > 0 else None
+
+    qed = [r['chem_results']['qed'] for r in results]
+    sa = [r['chem_results']['sa'] for r in results]
+    qed_mean = float(np.mean(qed)) if qed else None
+    qed_med = float(np.median(qed)) if qed else None
+    sa_mean = float(np.mean(sa)) if sa else None
+    sa_med = float(np.median(sa)) if sa else None
+
+    out = {
+        'mol_stable': fraction_mol_stable,
+        'atm_stable': fraction_atm_stable,
+        'recon_success': fraction_recon,
+        'eval_success': fraction_eval,
+        'complete': fraction_complete,
+        'n_recon': n_recon_success,
+        'n_complete': n_complete,
+        'n_eval': len(results),
+        'n_samples': num_samples,
+        'atom_type_js': atom_type_js,
+        'QED_mean': qed_mean,
+        'QED_med': qed_med,
+        'SA_mean': sa_mean,
+        'SA_med': sa_med,
+    }
+    for k, v in c_bond_length_dict.items():
+        out[k] = v
+    for k, v in success_js_metrics.items():
+        out[k] = v
+
+    if save:
+        validity_dict = {k: out[k] for k in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']}
+        torch.save({'stability': validity_dict, 'bond_length': all_bond_dist, 'all_results': results},
+                   os.path.join(result_path, f'metrics_{eval_step}.pt'))
+        if success_pair_length_profile is not None:
+            eval_bond_length.plot_distance_hist(success_pair_length_profile,
+                                                metrics=success_js_metrics,
+                                                save_path=os.path.join(result_path, f'pair_dist_hist_{eval_step}.png'))
+    return out, results
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('sample_path', type=str)
@@ -49,161 +180,48 @@ if __name__ == '__main__':
     result_path = os.path.join(args.sample_path, 'eval_results')
     os.makedirs(result_path, exist_ok=True)
     logger = misc.get_logger('evaluate', log_dir=result_path)
-    if not args.verbose:
-        RDLogger.DisableLog('rdApp.*')
 
-    # Load generated data
-    results_fn_list = glob(os.path.join(args.sample_path, '*result_*.pt'))
-    results_fn_list = sorted(results_fn_list, key=lambda x: int(os.path.basename(x)[:-3].split('_')[-1]))
-    if args.eval_num_examples is not None:
-        results_fn_list = results_fn_list[:args.eval_num_examples]
-    num_examples = len(results_fn_list)
-    logger.info(f'Load generated data done! {num_examples} examples in total.')
-
-    num_samples = 0
-    all_mol_stable, all_atom_stable, all_n_atom = 0, 0, 0
-    n_recon_success, n_eval_success, n_complete = 0, 0, 0
-    results = []
-    all_pair_dist, all_bond_dist = [], []
-    all_atom_types = Counter()
-    success_pair_dist, success_atom_types = [], Counter()
-    for example_idx, r_name in enumerate(tqdm(results_fn_list, desc='Eval')):
-        r = torch.load(r_name)  # ['data', 'pred_ligand_pos', 'pred_ligand_v', 'pred_ligand_pos_traj', 'pred_ligand_v_traj']
-        sample_idxs = []
-        all_pred_ligand_pos = r['pred_ligand_pos_traj']  # [num_samples, num_steps, num_atoms, 3]
-        all_pred_ligand_v = r['pred_ligand_v_traj']
-        num_samples += len(all_pred_ligand_pos)
-
-        for sample_idx, (pred_pos, pred_v) in enumerate(zip(all_pred_ligand_pos, all_pred_ligand_v)):
-            pred_pos, pred_v = pred_pos[args.eval_step], pred_v[args.eval_step]
-
-            # stability check
-            pred_atom_type = transforms.get_atomic_number_from_index(pred_v, mode=args.atom_enc_mode)
-            all_atom_types += Counter(pred_atom_type)
-            r_stable = analyze.check_stability(pred_pos, pred_atom_type)
-            all_mol_stable += r_stable[0]
-            all_atom_stable += r_stable[1]
-            all_n_atom += r_stable[2]
-
-            pair_dist = eval_bond_length.pair_distance_from_pos_v(pred_pos, pred_atom_type)
-            all_pair_dist += pair_dist
-
-            # reconstruction
-            try:
-                pred_aromatic = transforms.is_aromatic_from_index(pred_v, mode=args.atom_enc_mode)
-                mol = reconstruct.reconstruct_from_generated(pred_pos, pred_atom_type, pred_aromatic)
-                smiles = Chem.MolToSmiles(mol)
-            except reconstruct.MolReconsError:
-                if args.verbose:
-                    logger.warning('Reconstruct failed %s' % f'{example_idx}_{sample_idx}')
-                continue
-            n_recon_success += 1
-
-            if '.' in smiles:
-                continue
-            n_complete += 1
-
-            # chemical and docking check
-            try:
-                chem_results = scoring_func.get_chem(mol)
-                if args.docking_mode == 'qvina':
-                    vina_task = QVinaDockingTask.from_generated_mol(
-                        mol, r['data'].ligand_filename, protein_root=args.protein_root)
-                    vina_results = vina_task.run_sync()
-                elif args.docking_mode in ['vina_score', 'vina_dock']:
-                    vina_task = VinaDockingTask.from_generated_mol(
-                        mol, r['data'].ligand_filename, protein_root=args.protein_root)
-                    score_only_results = vina_task.run(mode='score_only', exhaustiveness=args.exhaustiveness)
-                    minimize_results = vina_task.run(mode='minimize', exhaustiveness=args.exhaustiveness)
-                    vina_results = {
-                        'score_only': score_only_results,
-                        'minimize': minimize_results
-                    }
-                    if args.docking_mode == 'vina_dock':
-                        docking_results = vina_task.run(mode='dock', exhaustiveness=args.exhaustiveness)
-                        vina_results['dock'] = docking_results
-                else:
-                    vina_results = None
-
-                n_eval_success += 1
-            except:
-                if args.verbose:
-                    logger.warning('Evaluation failed for %s' % f'{example_idx}_{sample_idx}')
-                continue
-
-            # now we only consider complete molecules as success
-            bond_dist = eval_bond_length.bond_distance_from_mol(mol)
-            all_bond_dist += bond_dist
-
-            success_pair_dist += pair_dist
-            success_atom_types += Counter(pred_atom_type)
-
-            results.append({
-                'mol': mol,
-                'smiles': smiles,
-                'ligand_filename': r['data'].ligand_filename,
-                'pred_pos': pred_pos,
-                'pred_v': pred_v,
-                'chem_results': chem_results,
-                'vina': vina_results,
-                'sample_idx': sample_idx
-            })
-    logger.info(f'Evaluate done! {num_samples} samples in total.')
-
-    fraction_mol_stable = all_mol_stable / num_samples
-    fraction_atm_stable = all_atom_stable / all_n_atom if all_n_atom > 0 else 0.0
-    fraction_recon = n_recon_success / num_samples
-    fraction_eval = n_eval_success / num_samples
-    fraction_complete = n_complete / num_samples
-    validity_dict = {
-        'mol_stable': fraction_mol_stable,
-        'atm_stable': fraction_atm_stable,
-        'recon_success': fraction_recon,
-        'eval_success': fraction_eval,
-        'complete': fraction_complete
-    }
+    out, results = run_evaluation(
+        sample_path=args.sample_path,
+        eval_step=args.eval_step,
+        eval_num_examples=args.eval_num_examples,
+        docking_mode=args.docking_mode,
+        protein_root=args.protein_root,
+        atom_enc_mode=args.atom_enc_mode,
+        verbose=args.verbose,
+        save=args.save,
+        exhaustiveness=args.exhaustiveness,
+        logger=logger,
+    )
+    validity_dict = {k: out[k] for k in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']}
     print_dict(validity_dict, logger)
 
-    c_bond_length_profile = eval_bond_length.get_bond_length_profile(all_bond_dist)
-    c_bond_length_dict = eval_bond_length.eval_bond_length_profile(c_bond_length_profile)
-    logger.info('JS bond distances of complete mols: ')
-    print_dict(c_bond_length_dict, logger)
-
-    success_pair_length_profile = eval_bond_length.get_pair_length_profile(success_pair_dist)
-    if len(success_pair_dist) > 0:
-        success_js_metrics = eval_bond_length.eval_pair_length_profile(success_pair_length_profile)
+    # Bond-length JSD (from complete mols) vs pair-length JSD (CC_2A, All_12A)
+    bond_js_keys = [k for k in out if k.startswith('JSD_') and k not in ('JSD_CC_2A', 'JSD_All_12A')]
+    pair_js_keys = [k for k in ('JSD_CC_2A', 'JSD_All_12A') if k in out]
+    c_bond_length_dict = {k: out[k] for k in bond_js_keys}
+    success_js_metrics = {k: out[k] for k in pair_js_keys}
+    if c_bond_length_dict:
+        logger.info('JS bond distances of complete mols: ')
+        print_dict(c_bond_length_dict, logger)
+    if success_js_metrics:
         print_dict(success_js_metrics, logger)
-    else:
-        success_js_metrics = {}
-        logger.info('No successful pair distances; skip pair-length JS metrics.')
 
-    if sum(success_atom_types.values()) > 0:
-        atom_type_js = eval_atom_type.eval_atom_type_distribution(success_atom_types)
-        logger.info('Atom type JS: %.4f' % atom_type_js)
-    else:
-        atom_type_js = None
-        logger.info('Atom type JS: None (no evaluated molecules)')
-
-    if args.save:
-        eval_bond_length.plot_distance_hist(success_pair_length_profile,
-                                            metrics=success_js_metrics,
-                                            save_path=os.path.join(result_path, f'pair_dist_hist_{args.eval_step}.png'))
-
+    logger.info('Atom type JS: %s' % out.get('atom_type_js'))
     logger.info('Number of reconstructed mols: %d, complete mols: %d, evaluated mols: %d' % (
-        n_recon_success, n_complete, len(results)))
+        out['n_recon'], out['n_complete'], out['n_eval']))
 
-    qed = [r['chem_results']['qed'] for r in results]
-    sa = [r['chem_results']['sa'] for r in results]
-    if len(qed) > 0:
-        logger.info('QED:   Mean: %.3f Median: %.3f' % (np.mean(qed), np.median(qed)))
-        logger.info('SA:    Mean: %.3f Median: %.3f' % (np.mean(sa), np.median(sa)))
+    qed, sa = [r['chem_results']['qed'] for r in results], [r['chem_results']['sa'] for r in results]
+    if qed:
+        logger.info('QED:   Mean: %.3f Median: %.3f' % (out['QED_mean'], out['QED_med']))
+        logger.info('SA:    Mean: %.3f Median: %.3f' % (out['SA_mean'], out['SA_med']))
     else:
         logger.info('QED:   Mean: None Median: None')
         logger.info('SA:    Mean: None Median: None')
-    if args.docking_mode == 'qvina':
+    if args.docking_mode == 'qvina' and results:
         vina = [r['vina'][0]['affinity'] for r in results]
         logger.info('Vina:  Mean: %.3f Median: %.3f' % (np.mean(vina), np.median(vina)))
-    elif args.docking_mode in ['vina_dock', 'vina_score']:
+    elif args.docking_mode in ['vina_dock', 'vina_score'] and results:
         vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
         vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
         logger.info('Vina Score:  Mean: %.3f Median: %.3f' % (np.mean(vina_score_only), np.median(vina_score_only)))
@@ -212,7 +230,6 @@ if __name__ == '__main__':
             vina_dock = [r['vina']['dock'][0]['affinity'] for r in results]
             logger.info('Vina Dock :  Mean: %.3f Median: %.3f' % (np.mean(vina_dock), np.median(vina_dock)))
 
-    # check ring distribution (optional)
     if not args.one_line:
         print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
 
@@ -224,32 +241,21 @@ if __name__ == '__main__':
                 return '%.4f' % v
             return str(v)
         names, values = [], []
-        for name, val in [
-            ('mol_stable', fraction_mol_stable),
-            ('atm_stable', fraction_atm_stable),
-            ('recon_success', fraction_recon),
-            ('eval_success', fraction_eval),
-            ('complete', fraction_complete),
-        ]:
+        for name in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']:
             names.append(name)
-            values.append(_fmt(val))
-        for k, v in sorted(c_bond_length_dict.items()):
+            values.append(_fmt(out[name]))
+        for k in sorted(c_bond_length_dict.keys()):
             names.append(k)
-            values.append(_fmt(v))
-        for k, v in sorted(success_js_metrics.items()):
+            values.append(_fmt(out.get(k)))
+        for k in sorted(success_js_metrics.keys()):
             names.append(k)
-            values.append(_fmt(v))
+            values.append(_fmt(out.get(k)))
         names.append('atom_type_js')
-        values.append(_fmt(atom_type_js))
+        values.append(_fmt(out.get('atom_type_js')))
         names.extend(['n_recon', 'n_complete', 'n_eval'])
-        values.extend([str(n_recon_success), str(n_complete), str(len(results))])
+        values.extend([str(out['n_recon']), str(out['n_complete']), str(out['n_eval'])])
         names.extend(['QED_mean', 'QED_med', 'SA_mean', 'SA_med'])
-        values.extend([
-            _fmt(np.mean(qed) if qed else None),
-            _fmt(np.median(qed) if qed else None),
-            _fmt(np.mean(sa) if sa else None),
-            _fmt(np.median(sa) if sa else None),
-        ])
+        values.extend([_fmt(out['QED_mean']), _fmt(out['QED_med']), _fmt(out['SA_mean']), _fmt(out['SA_med'])])
         if args.docking_mode == 'qvina' and results:
             vina = [r['vina'][0]['affinity'] for r in results]
             names.extend(['Vina_mean', 'Vina_med'])
@@ -261,10 +267,3 @@ if __name__ == '__main__':
             values.extend([_fmt(np.mean(vina_score_only)), _fmt(np.mean(vina_min))])
         logger.info('METRICS_ONE_LINE_HEAD\t' + '\t'.join(names))
         logger.info('METRICS_ONE_LINE_VAL\t' + '\t'.join(values))
-
-    if args.save:
-        torch.save({
-            'stability': validity_dict,
-            'bond_length': all_bond_dist,
-            'all_results': results
-        }, os.path.join(result_path, f'metrics_{args.eval_step}.pt'))

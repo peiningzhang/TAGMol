@@ -1,6 +1,7 @@
 import argparse
 import os
 import shutil
+import tempfile
 
 import numpy as np
 import torch
@@ -18,6 +19,8 @@ import utils.transforms as trans
 from datasets import get_dataset
 from datasets.pl_data import FOLLOW_BATCH
 from models.molopt_score_model import ScorePosNet3D
+from scripts.sample_diffusion import sample_diffusion_ligand
+from scripts.evaluate_diffusion import run_evaluation
 
 
 def get_auroc(y_true, y_pred, feat_mode):
@@ -322,6 +325,11 @@ if __name__ == '__main__':
         return avg_loss
 
 
+    # Quick-eval (sampling + full metrics) every N steps for wandb
+    quick_eval_freq = getattr(config.train, 'quick_eval_freq', 10000)
+    quick_eval_num_proteins = getattr(config.train, 'quick_eval_num_proteins', 10)
+    quick_eval_num_ligands = getattr(config.train, 'quick_eval_num_ligands_per_protein', 10)
+
     # Training loop
     import time
     start_time = time.time()
@@ -331,6 +339,53 @@ if __name__ == '__main__':
         for it in range(1, config.train.max_iters + 1):
             # with torch.autograd.detect_anomaly():
             train(it)
+            # Quick eval: sample + full metrics every quick_eval_freq steps, log to wandb
+            if (it % quick_eval_freq == 0) and not args.trial and use_wandb:
+                tmp_dir = tempfile.mkdtemp(prefix='train_quick_eval_', dir=log_dir)
+                try:
+                    model.eval()
+                    n_pocket = min(quick_eval_num_proteins, len(val_set))
+                    for data_id in range(n_pocket):
+                        data = val_set[data_id]
+                        with torch.no_grad():
+                            pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, pred_pos0_traj, time_list = sample_diffusion_ligand(
+                                model, data, quick_eval_num_ligands,
+                                batch_size=min(quick_eval_num_ligands, 10),
+                                device=args.device,
+                                num_steps=config.model.num_diffusion_timesteps,
+                                pos_only=False,
+                                center_pos_mode=config.model.center_pos_mode,
+                                sample_num_atoms='prior',
+                            )
+                        result = {
+                            'data': data,
+                            'pred_ligand_pos': pred_pos,
+                            'pred_ligand_v': pred_v,
+                            'pred_ligand_pos_traj': pred_pos_traj,
+                            'pred_ligand_v_traj': pred_v_traj,
+                            'pred_ligand_pos0_traj': pred_pos0_traj,
+                            'pred_ligand_v0_traj': pred_v0_traj,
+                            'time': time_list,
+                        }
+                        torch.save(result, os.path.join(tmp_dir, f'result_{data_id}.pt'))
+                    metrics, _ = run_evaluation(
+                        tmp_dir,
+                        eval_step=-1,
+                        eval_num_examples=n_pocket,
+                        docking_mode='none',
+                        protein_root=config.data.path if hasattr(config.data, 'path') else './data/crossdocked_v1.1_rmsd1.0',
+                        atom_enc_mode=config.data.transform.ligand_atom_mode,
+                        verbose=False,
+                        save=False,
+                    )
+                    eval_log = {f'eval/{k}': v for k, v in metrics.items() if v is not None}
+                    if eval_log:
+                        wandb.log(eval_log, step=it)
+                    logger.info('[QuickEval] Iter %d | %s' % (it, ' '.join('%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None)))
+                finally:
+                    model.train()
+                    if os.path.isdir(tmp_dir):
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
             if it % config.train.val_freq == 0 or it == config.train.max_iters:
                 val_loss = validate(it)
                 if best_loss is None or val_loss < best_loss:
