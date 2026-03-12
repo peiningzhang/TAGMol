@@ -153,13 +153,13 @@ def main():
     ).to(args.device)
     # 在 main 里，model = ScorePosNet3D(...) 之后加：
     if hasattr(config, "model") and hasattr(config.model, "time_scheduler"):
-        model.time_scheduler = config.model.time_scheduler
+        model.config.time_scheduler = config.model.time_scheduler
     if hasattr(config, "model") and hasattr(config.model, "rho"):
         model.rho = config.model.rho
-    if hasattr(config, "model") and hasattr(config.model, "dfm_beta"):
-        model.dfm_beta = config.model.dfm_beta
     if hasattr(config, "model") and hasattr(config.model, "dfm_num_steps"):
         model.dfm_num_steps = config.model.dfm_num_steps
+    if hasattr(config, "model") and hasattr(config.model, "dfm_type"):
+        model.config.dfm_type = config.model.dfm_type
     model.load_state_dict(ckpt["model"])
     model.eval()
     logger.info(f"Loaded model from checkpoint: {args.checkpoint}")

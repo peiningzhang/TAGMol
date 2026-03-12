@@ -876,7 +876,129 @@ class ScorePosNet3D(nn.Module):
 
         ligand_v_next = torch.distributions.Categorical(probs=p_step).sample()
         return ligand_v_next, p_step, p_1_given_t
+    def campbell_dfm_step(self, ligand_v, pred_ligand_v, sigma_i, sigma_next, batch_ligand, eps=1e-5):
+        """
+        Campbell-style discrete update (no explicit mask token).
 
+        This is inspired by mask/unmask dynamics: sample a "clean" proposal x1 from p_1_given_t,
+        then probabilistically replace current categories with x1. Optionally inject additional
+        stochasticity by randomly resampling some nodes from the uniform prior.
+
+        We use the local convention:
+            mask_rate = sigma / (sigma + sigma_data)
+            t = 1 - mask_rate
+
+        Args/Returns are identical to `gat_dfm_step`.
+        """
+        S = self.num_classes
+        device = pred_ligand_v.device
+
+        # Network predicted clean distribution
+        p_1_given_t = F.softmax(pred_ligand_v, dim=-1)
+
+        # Time variable: t = 1 - mask_rate (per-atom)
+        mask_rate = self.dfm_scheduler.mask_rate(sigma_i)[batch_ligand]           # (N_atoms, 1)
+        mask_rate_next = self.dfm_scheduler.mask_rate(sigma_next)[batch_ligand]   # (N_atoms, 1)
+        t = 1.0 - mask_rate
+        t_next = 1.0 - mask_rate_next
+
+        # Positive step size in t-space
+        dt = (t_next - t).clamp(min=0.0)
+
+        # Alpha schedule: simple choice alpha_t := t (monotone increasing as we denoise)
+        alpha_t = t.clamp(min=0.0, max=1.0 - 1e-6)
+        alpha_t_next = t_next.clamp(min=0.0, max=1.0 - 1e-6)
+        alpha_t_prime = (alpha_t_next - alpha_t) / dt.clamp(min=1e-12)
+
+        stochasticity = getattr(self.config, 'campbell_stochasticity', 1.0)
+        stochasticity = float(stochasticity)/self.dfm_scheduler.mask_rate_derivative(sigma_i)
+        stochasticity = stochasticity[batch_ligand]
+
+        # Probabilities (per-atom) to move towards x1 / add noise
+        unmask_prob = dt * (alpha_t_prime + stochasticity * alpha_t) / (1.0 - alpha_t).clamp(min=eps)
+        mask_prob = dt * stochasticity
+        unmask_prob = unmask_prob.clamp(min=0.0, max=1.0)
+        mask_prob = mask_prob.clamp(min=0.0, max=1.0)
+        #这里的归一化并不是符合理论的，需要重新推导
+        unmask_prob = unmask_prob/(unmask_prob + mask_prob)
+
+        # Sample x1 from p_1_given_t and decide which nodes to replace
+        x1 = torch.distributions.Categorical(probs=p_1_given_t).sample()  # (N_atoms,)
+        will_unmask = (torch.rand(ligand_v.shape[0], device=device) < unmask_prob.squeeze(-1))
+
+        ligand_v_next = ligand_v.clone()
+        ligand_v_next[will_unmask] = x1[will_unmask]
+
+        # Construct a corresponding probability tensor for logging/trajectory
+        X_t = F.one_hot(ligand_v, num_classes=S).float()
+        uniform = torch.full_like(p_1_given_t, 1.0 / S)
+        p_step = (1.0 - unmask_prob - mask_prob).clamp(min=0.0) * X_t + unmask_prob * p_1_given_t + mask_prob * uniform
+        p_step = torch.clamp(p_step, min=1e-9)
+        p_step = p_step / p_step.sum(dim=-1, keepdim=True)
+
+        return ligand_v_next, p_step, p_1_given_t
+
+    # def campbell_dfm_step(self, ligand_v, pred_ligand_v, sigma_i, sigma_next, batch_ligand, eps=1e-5):
+    #     """
+    #     Campbell-style discrete update (no explicit mask token).
+
+    #     This is inspired by mask/unmask dynamics: sample a "clean" proposal x1 from p_1_given_t,
+    #     then probabilistically replace current categories with x1. Optionally inject additional
+    #     stochasticity by randomly resampling some nodes from the uniform prior.
+
+    #     We use the local convention:
+    #         mask_rate = sigma / (sigma + sigma_data)
+    #         t = 1 - mask_rate
+
+    #     Args/Returns are identical to `gat_dfm_step`.
+    #     """
+    #     S = self.num_classes
+    #     device = pred_ligand_v.device
+
+    #     # Network predicted clean distribution
+    #     p_1_given_t = F.softmax(pred_ligand_v, dim=-1)
+
+    #     # Time variable: t = 1 - mask_rate (per-atom)
+    #     mask_rate = self.dfm_scheduler.mask_rate(sigma_i)[batch_ligand]           # (N_atoms, 1)
+    #     mask_rate_next = self.dfm_scheduler.mask_rate(sigma_next)[batch_ligand]   # (N_atoms, 1)
+    #     t = 1.0 - mask_rate
+    #     t_next = 1.0 - mask_rate_next
+
+    #     # Positive step size in t-space
+    #     dt = (t_next - t).clamp(min=0.0)
+
+    #     # Alpha schedule: simple choice alpha_t := t (monotone increasing as we denoise)
+    #     alpha_t = t.clamp(min=0.0, max=1.0 - 1e-6)
+    #     alpha_t_next = t_next.clamp(min=0.0, max=1.0 - 1e-6)
+    #     alpha_t_prime = (alpha_t_next - alpha_t) / dt.clamp(min=1e-12)
+
+    #     mask_rate_derivative = self.dfm_scheduler.mask_rate_derivative(sigma_i)[batch_ligand]
+    #     stochasticity = getattr(self.config, 'campbell_stochasticity', 1.0)
+    #     stochasticity = float(stochasticity)/mask_rate_derivative
+        
+        
+    #     unmask_prob = (stochasticity * (S * alpha_t + mask_rate) + mask_rate_derivative)/(1.0 - alpha_t).clamp(min=eps)
+
+    #     mask_prob = dt * stochasticity
+    #     unmask_prob = unmask_prob.clamp(min=0.0, max=1.0)
+    #     mask_prob = mask_prob.clamp(min=0.0, max=1.0)
+    #     unmask_prob = unmask_prob/(unmask_prob + mask_prob)
+
+    #     # Sample x1 from p_1_given_t and decide which nodes to replace
+    #     x1 = torch.distributions.Categorical(probs=p_1_given_t).sample()  # (N_atoms,)
+    #     will_unmask = (torch.rand(ligand_v.shape[0], device=device) < unmask_prob.squeeze(-1))
+
+    #     ligand_v_next = ligand_v.clone()
+    #     ligand_v_next[will_unmask] = x1[will_unmask]
+
+    #     # Construct a corresponding probability tensor for logging/trajectory
+    #     X_t = F.one_hot(ligand_v, num_classes=S).float()
+    #     uniform = torch.full_like(p_1_given_t, 1.0 / S)
+    #     p_step = (1.0 - unmask_prob - mask_prob).clamp(min=0.0) * X_t + unmask_prob * p_1_given_t + mask_prob * uniform
+    #     p_step = torch.clamp(p_step, min=1e-9)
+    #     p_step = p_step / p_step.sum(dim=-1, keepdim=True)
+
+    #     return ligand_v_next, p_step, p_1_given_t
     @torch.no_grad()
     def sample_diffusion(self, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
@@ -916,6 +1038,7 @@ class ScorePosNet3D(nn.Module):
             device = protein_pos.device
             n_dfm = getattr(self, 'dfm_num_steps', 100)  # N=100 per VEDA_DFM.md
             time_scheduler = getattr(self.config, 'time_scheduler', 'log_uniform')
+            print(f"time_scheduler: {time_scheduler}, rho: {self.rho}")
             sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
             # DFM: t in [0, t_max] for kappa(t)=t/(t+1)
             # Training: t=0 (clean, kappa=0) -> t=t_max (noise, kappa->1)
@@ -949,54 +1072,27 @@ class ScorePosNet3D(nn.Module):
                 # Euler step for pos: d_i = (pos_i - D_theta) / sigma_i, pos_next = pos_i + dt * d_i
                 step_size = (sigma_next_per_atom - sigma_per_atom) # step_size is negative
                 d_i = (ligand_pos - D_theta) / sigma_per_atom.clamp(min=1e-12)
+                # 位置在 step 内部、更新完 ligand_pos 之后
                 ligand_pos = ligand_pos + step_size * d_i
+                
+                # if getattr(self.config, 'dfm_type', 'gat') == 'campbell':
+                #     discrete_update = self.campbell_dfm_step
+                # else:
+                #     discrete_update = self.gat_dfm_step
                 if not pos_only:
-                    # 获取时间调度系数
-                    kappa_t_graph = self.dfm_scheduler.kappa(sigma_i)
-                    d_kappa_t_graph = self.dfm_scheduler.d_kappa_dt(sigma_i)
-                    kappa_t = kappa_t_graph[batch_ligand]        # (N_atoms, 1)
-                    d_kappa_t = d_kappa_t_graph[batch_ligand]    # (N_atoms, 1)
-                    mask_rate = self.dfm_scheduler.mask_rate(sigma_i)[batch_ligand]
-                    mask_rate_next = self.dfm_scheduler.mask_rate(sigma_next)[batch_ligand]
-
-                    # dt = kappa_t - kappa_next
-                    dt = (mask_rate - mask_rate_next)
-                    #dt is the time step size, is positive
-                    # 1. 准备当前状态的 One-hot 编码 和 网络预测的干净数据分布
-                    X_t = F.one_hot(ligand_v, num_classes=S).float()
-                    p_1_given_t = F.softmax(pred_ligand_v, dim=-1)
-
-                    # 2. 计算前向概率速度 (指向网络的预测分布)
-                    u_fwd = (d_kappa_t / (1.0 - kappa_t).clamp(min=eps)) * (p_1_given_t - X_t)
-
-                    # 3. 计算后向概率速度 (指向纯噪声的均匀分布 1/S)
-                    # 注意：这是 VEDA 与你找的代码最大的区别，用 1.0/S 代替了 delta_mask
-                    u_bwd = (d_kappa_t / kappa_t.clamp(min=eps)) * (X_t - 1.0 / S)
-
-                    # 4. 组合概率速度 (Predictor-Corrector 融合)
-                    # 假设 config.corrector_weight = 0.1 (即 beta_t)
-                    beta = getattr(self.config, 'corrector_weight', 0.1)
-                    forward_weight = 1.0 + beta
-                    backward_weight = beta
-                    
-                    pvel = forward_weight * u_fwd - backward_weight * u_bwd
-
-                    # 5. 在概率单纯形上执行 Euler 步进
-                    # dt = sigma_{i+1} - sigma_i 的时间映射差值，或者简单固定为 1/N
-                    p_step = X_t + dt * pvel
-
-                    # 6. 安全截断与重归一化 (比原版的单纯 clamp 1e-9 更安全严谨)
-                    p_step = torch.clamp(p_step, min=1e-9)
-                    p_step = p_step / p_step.sum(dim=-1, keepdim=True)
-
-                    # 7. 一次性完成采样
-                    ligand_v = torch.distributions.Categorical(probs=p_step).sample()
-                    ###TEMP,TODO: remove thisd
-                    ligand_v = torch.distributions.Categorical(probs=F.softmax(pred_ligand_v, dim=-1)).sample()
-
+                    ligand_v, p_step, p_1_given_t = self.campbell_dfm_step(
+                        ligand_v=ligand_v,
+                        pred_ligand_v=pred_ligand_v,
+                        sigma_i=sigma_i,
+                        sigma_next=sigma_next,
+                        batch_ligand=batch_ligand,
+                        eps=eps,
+                        # last_step=step == n_dfm-1
+                    )
                     v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
                     vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
 
+                    # ligand_v = torch.distributions.Categorical(probs=F.softmax(pred_ligand_v, dim=-1)).sample()
 
 
                 if step in [0, n_dfm//2, n_dfm-1] and (ligand_pos.shape[0] > 0):

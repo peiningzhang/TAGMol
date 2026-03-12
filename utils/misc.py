@@ -115,9 +115,11 @@ class DFMTimeScheduler:
     def mask_rate(self, sigma):
         """Mask rate = sigma / (sigma + sigma_data)."""
         return sigma / (sigma + self.sigma_data)
+    def mask_rate_derivative(self, sigma):
+        """Derivative of mask rate with respect to sigma."""
+        return 1 / (sigma + self.sigma_data)**2
     def kappa(self, sigma):
         """Interpolation coefficient mask_rate = sigma / (sigma + sigma_data)."""
-
         mask_rate = sigma / (sigma + self.sigma_data)
         if isinstance(sigma, torch.Tensor):
             return (1 - mask_rate)**2
