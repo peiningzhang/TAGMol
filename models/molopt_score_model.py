@@ -1037,7 +1037,6 @@ class ScorePosNet3D(nn.Module):
             # DFM: t in [0, t_max] for kappa(t)=t/(t+1)
             # Training: t=0 (clean, kappa=0) -> t=t_max (noise, kappa->1)
             # Sampling: Reverse direction, from noise (t=t_max) to clean (t=0)
-            beta = self.dfm_beta
             S = self.num_classes
             eps = 1e-5
             noise_injection = False

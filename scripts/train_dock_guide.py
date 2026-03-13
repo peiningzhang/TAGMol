@@ -45,6 +45,10 @@ if __name__ == '__main__':
     parser.add_argument('--logdir', type=str, default='./logs')
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--train_report_iter', type=int, default=200)
+    parser.add_argument('--wandb_id', type=str, default=None, help='Wandb run ID to resume')
+    parser.add_argument('--wandb_resume', type=str, default=None, 
+                       choices=['allow', 'must', 'never'], 
+                       help='Wandb resume mode: allow (resume if exists), must (require resume), never (always new)')
     args = parser.parse_args()
 
     # Load configs
@@ -61,14 +65,39 @@ if __name__ == '__main__':
     logger = misc.get_logger('train', log_dir)
     writer = torch.utils.tensorboard.SummaryWriter(log_dir)
     
-    # Initialize wandb
-    wandb.init(
-        project="tagmol-guide",
-        name=f"{config_name}_{args.tag}" if args.tag else config_name,
-        config=config,
-        dir=log_dir,
-        save_code=True
-    )
+    # Initialize wandb with resume support
+    wandb_init_kwargs = {
+        'project': "tagmol-guide",
+        'name': f"{config_name}_{args.tag}" if args.tag else config_name,
+        'config': config,
+        'dir': log_dir,
+        'save_code': True
+    }
+    
+    # Handle wandb resume logic
+    if args.wandb_id:
+        # Resume specific run by ID
+        wandb_init_kwargs['id'] = args.wandb_id
+        wandb_init_kwargs['resume'] = 'must'  # Must resume this specific run
+        logger.info(f'Resuming wandb run with ID: {args.wandb_id}')
+    elif args.wandb_resume:
+        # Use resume mode (allow/must/never)
+        wandb_init_kwargs['resume'] = args.wandb_resume
+        if args.wandb_resume == 'allow':
+            logger.info('Wandb resume mode: allow (will resume if run exists)')
+        elif args.wandb_resume == 'must':
+            logger.info('Wandb resume mode: must (will fail if run does not exist)')
+        elif args.wandb_resume == 'never':
+            logger.info('Wandb resume mode: never (always create new run)')
+    else:
+        # Default: create new run
+        logger.info('Creating new wandb run')
+    
+    wandb.init(**wandb_init_kwargs)
+    
+    # Log wandb run ID for future reference
+    logger.info(f'Wandb run ID: {wandb.run.id}')
+    logger.info(f'Wandb run URL: {wandb.run.url}')
     
     logger.info(args)
     logger.info(config)
