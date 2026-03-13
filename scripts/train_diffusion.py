@@ -54,6 +54,7 @@ if __name__ == '__main__':
     parser.add_argument('--val_freq', type=int, default=None, help='Override validation frequency')
     parser.add_argument('--batch_size', type=int, default=None, help='Override batch size')
     parser.add_argument('--num_workers', type=int, default=None, help='Override num workers')
+    parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint (path to checkpoint file)')
     args = parser.parse_args()
 
     # Load configs
@@ -161,11 +162,16 @@ if __name__ == '__main__':
 
     # follow_batch = ['protein_element', 'ligand_element']
     collate_exclude_keys = ['ligand_nbh_list']
+    # Optimize DataLoader for better GPU utilization
+    # pin_memory=True: Faster CPU->GPU transfer
+    # persistent_workers=True: Keep workers alive between epochs
     train_iterator = utils_train.inf_iterator(DataLoader(
         train_set,
         batch_size=config.train.batch_size,
         shuffle=True,
         num_workers=config.train.num_workers,
+        pin_memory=True if args.device == 'cuda' else False,  # Enable pin_memory for CUDA
+        persistent_workers=True if config.train.num_workers > 0 else False,
         follow_batch=FOLLOW_BATCH,
         exclude_keys=collate_exclude_keys
     ))
@@ -186,6 +192,47 @@ if __name__ == '__main__':
     # Optimizer and scheduler
     optimizer = utils_train.get_optimizer(config.train.optimizer, model)
     scheduler = utils_train.get_scheduler(config.train.scheduler, optimizer)
+    
+    # Resume from checkpoint if specified
+    start_iter = 1
+    best_loss = None
+    best_iter = None
+    if args.resume is not None:
+        logger.info(f'Resuming training from checkpoint: {args.resume}')
+        ckpt = torch.load(args.resume, map_location=args.device)
+        
+        # Load model state
+        model.load_state_dict(ckpt['model'])
+        logger.info('Loaded model state')
+        
+        # Load optimizer state
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+            logger.info('Loaded optimizer state')
+        
+        # Load scheduler state
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
+            logger.info('Loaded scheduler state')
+        
+        # Load training state
+        if 'iteration' in ckpt:
+            start_iter = ckpt['iteration'] + 1
+            logger.info(f'Resuming from iteration: {start_iter}')
+        
+        if 'best_loss' in ckpt:
+            best_loss = ckpt['best_loss']
+            logger.info(f'Previous best loss: {best_loss:.6f}')
+        
+        if 'best_iter' in ckpt:
+            best_iter = ckpt['best_iter']
+            logger.info(f'Previous best iteration: {best_iter}')
+        
+        # Use config from checkpoint if available (for compatibility)
+        if 'config' in ckpt and not args.trial:
+            logger.info('Note: Using config from command line, not checkpoint')
+        
+        logger.info('Checkpoint loaded successfully!')
 
 
     def train(it):
@@ -335,10 +382,24 @@ if __name__ == '__main__':
     start_time = time.time()
 
     try:
-        best_loss, best_iter = None, None
-        for it in range(1, config.train.max_iters + 1):
+        # best_loss and best_iter are initialized above (from checkpoint if resuming)
+        for it in range(start_iter, config.train.max_iters + 1):
             # with torch.autograd.detect_anomaly():
             train(it)
+            
+            # Save last.pt at every iteration (skip in trial mode)
+            if not args.trial and it % quick_eval_freq == 0 or it == config.train.max_iters:
+                last_ckpt_path = os.path.join(ckpt_dir, 'last.pt')
+                torch.save({
+                    'config': config,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'iteration': it,
+                    'best_loss': best_loss,
+                    'best_iter': best_iter,
+                }, last_ckpt_path)
+                logger.info(f'[Checkpoint] Saved last checkpoint to: {last_ckpt_path} (iter {it})')
             # Quick eval: sample + full metrics every quick_eval_freq steps, log to wandb
             if (it % quick_eval_freq == 0) and not args.trial and use_wandb:
                 tmp_dir = tempfile.mkdtemp(prefix='train_quick_eval_', dir=log_dir)
@@ -380,7 +441,7 @@ if __name__ == '__main__':
                     )
                     eval_log = {f'eval/{k}': v for k, v in metrics.items() if v is not None}
                     if eval_log:
-                        wandb.log(eval_log, step=it)
+                        wandb.log(eval_log)
                     logger.info('[QuickEval] Iter %d | %s' % (it, ' '.join('%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None)))
                 finally:
                     model.train()
@@ -423,5 +484,22 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info('Terminating...')
     finally:
+        # Always save last.pt even if training is interrupted
+        if not args.trial and 'it' in locals():
+            try:
+                last_ckpt_path = os.path.join(ckpt_dir, 'last.pt')
+                torch.save({
+                    'config': config,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'iteration': it,
+                    'best_loss': best_loss if 'best_loss' in locals() else None,
+                    'best_iter': best_iter if 'best_iter' in locals() else None,
+                }, last_ckpt_path)
+                logger.info(f'[Checkpoint] Saved last checkpoint to: {last_ckpt_path}')
+            except Exception as e:
+                logger.warning(f'Failed to save last checkpoint: {e}')
+        
         if use_wandb:
             wandb.finish()

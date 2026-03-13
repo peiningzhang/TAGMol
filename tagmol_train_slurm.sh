@@ -1,15 +1,20 @@
 #!/bin/bash
 #SBATCH --job-name=tagmol_train
-#SBATCH --partition=priority-gpu
+#SBATCH --partition=general-gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/shared/healthinfolab/phz24002/TAGMol/logs/train_%j.out
 #SBATCH --error=/shared/healthinfolab/phz24002/TAGMol/logs/train_%j.err
-#SBATCH --constraint="a100"
+# SBATCH --constraint="a100"
+# Note: If 8 CPUs are not available, SLURM will either:
+#   1. Wait until resources are available
+#   2. Fail if partition limits don't allow 8 CPUs
+#   3. Allocate fewer CPUs if the node doesn't have 8 available
+# To check available resources: bash scripts/check_slurm_resources.sh
 
 # TAGMol Training Script for SLURM
 # Usage: sbatch tagmol_train_slurm.sh [diffusion|guide_ba|guide_qed|guide_sa]
@@ -34,7 +39,16 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Job Type: $JOB_TYPE"
 echo "Retry attempt: $RETRY_COUNT / $MAX_RETRIES"
 echo "Started: $(date)"
+echo "Allocated CPUs: $SLURM_CPUS_PER_TASK"
+echo "Allocated Memory: $SLURM_MEM_PER_NODE MB"
+echo "GPU: $CUDA_VISIBLE_DEVICES"
 echo "=========================================="
+
+# Check if we got the requested CPUs
+if [ ! -z "$SLURM_CPUS_PER_TASK" ] && [ "$SLURM_CPUS_PER_TASK" -lt 8 ]; then
+    echo "WARNING: Only $SLURM_CPUS_PER_TASK CPUs allocated (requested 8)"
+    echo "Consider reducing num_workers in config if data loading is slow"
+fi
 
 case $JOB_TYPE in
   diffusion)

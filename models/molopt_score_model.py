@@ -247,26 +247,28 @@ class ScorePosNet3D(nn.Module):
             alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
         alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+        if config.diffusion_type == 'veda':
+            self.num_timesteps = config.num_diffusion_timesteps
+        elif config.diffusion_type == 'ddpm':
+            self.betas = to_torch_const(betas)
+            self.num_timesteps = self.betas.size(0)
+            self.alphas_cumprod = to_torch_const(alphas_cumprod)
+            self.alphas_cumprod_prev = to_torch_const(alphas_cumprod_prev)
 
-        self.betas = to_torch_const(betas)
-        self.num_timesteps = self.betas.size(0)
-        self.alphas_cumprod = to_torch_const(alphas_cumprod)
-        self.alphas_cumprod_prev = to_torch_const(alphas_cumprod_prev)
+            # calculations for diffusion q(x_t | x_{t-1}) and others
+            self.sqrt_alphas_cumprod = to_torch_const(np.sqrt(alphas_cumprod))
+            self.sqrt_one_minus_alphas_cumprod = to_torch_const(np.sqrt(1. - alphas_cumprod))
+            self.sqrt_recip_alphas_cumprod = to_torch_const(np.sqrt(1. / alphas_cumprod))
+            self.sqrt_recipm1_alphas_cumprod = to_torch_const(np.sqrt(1. / alphas_cumprod - 1))
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.sqrt_alphas_cumprod = to_torch_const(np.sqrt(alphas_cumprod))
-        self.sqrt_one_minus_alphas_cumprod = to_torch_const(np.sqrt(1. - alphas_cumprod))
-        self.sqrt_recip_alphas_cumprod = to_torch_const(np.sqrt(1. / alphas_cumprod))
-        self.sqrt_recipm1_alphas_cumprod = to_torch_const(np.sqrt(1. / alphas_cumprod - 1))
-
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-        self.posterior_mean_c0_coef = to_torch_const(betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
-        self.posterior_mean_ct_coef = to_torch_const(
-            (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod))
-        # log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-        self.posterior_var = to_torch_const(posterior_variance)
-        self.posterior_logvar = to_torch_const(np.log(np.append(self.posterior_var[1], self.posterior_var[1:])))
+            # calculations for posterior q(x_{t-1} | x_t, x_0)
+            posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+            self.posterior_mean_c0_coef = to_torch_const(betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+            self.posterior_mean_ct_coef = to_torch_const(
+                (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod))
+            # log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+            self.posterior_var = to_torch_const(posterior_variance)
+            self.posterior_logvar = to_torch_const(np.log(np.append(self.posterior_var[1], self.posterior_var[1:])))
 
         # model definition (num_classes needed for prior_dist)
         self.hidden_dim = config.hidden_dim
@@ -289,15 +291,8 @@ class ScorePosNet3D(nn.Module):
             else:
                 raise ValueError(f"discrete_prior must be 'uniform' or 'marginal', got {discrete_prior}")
             self.register_buffer('prior_dist', prior_dist)
-            self.log_alphas_v = None
-            self.log_one_minus_alphas_v = None
-            self.log_alphas_cumprod_v = None
-            self.log_one_minus_alphas_cumprod_v = None
             # DFM: non-linear time scheduler (kappa_t, d_kappa_dt)
-            self.dfm_scheduler = DFMTimeScheduler(sigma_data=self.sigma_data)  # kappa = sigma/(sigma+sigma_data)
-            self.dfm_beta = getattr(config, 'dfm_beta', 0.1)  # noise injection for predictor-corrector
-            self.dfm_num_steps = getattr(config, 'dfm_num_steps', 100)  # N for h=1/N
-            self.dfm_t_max = getattr(config, 'dfm_t_max', 100.0)  # t in [0, t_max] for kappa(t)=t/(t+1) -> [0,1)
+            self.dfm_scheduler = DFMTimeScheduler(sigma_data=self.sigma_data, sigma_min=self.sigma_min, sigma_max=self.sigma_max, mask_mode=config.mask_mode)  # kappa = sigma/(sigma+sigma_data)
         else:
             # DDPM: atom type diffusion schedule in log space
             if config.v_beta_schedule == 'cosine':
@@ -364,13 +359,13 @@ class ScorePosNet3D(nn.Module):
     def sample_discrete_dfm_noise(self, v_1, sigma, batch):
         """Exact DFM: sample v_t from P(v_t|v_1) = kappa_t * OneHot(v_1) + (1-kappa_t) / S.
         Uses non-linear kappa(t), not linear t."""
-        k_t = self.dfm_scheduler.kappa(sigma)  # shape (num_graphs,) or (num_atoms,)
-        if k_t.dim() == 1 and len(k_t) == batch.max().item() + 1:
-            k_t = k_t[batch].unsqueeze(-1)  # (num_atoms, 1)
-        elif k_t.dim() == 1:
-            k_t = k_t.unsqueeze(-1)
+        mask_rate = self.dfm_scheduler.mask_rate(sigma)  # shape (num_graphs,) or (num_atoms,)
+        if mask_rate.dim() == 1 and len(mask_rate) == batch.max().item() + 1:
+            mask_rate = mask_rate[batch].unsqueeze(-1)  # (num_atoms, 1)
+        elif mask_rate.dim() == 1:
+            mask_rate = mask_rate.unsqueeze(-1)
         S = self.num_classes
-        prob = (1 - k_t) * F.one_hot(v_1, S).float() + k_t / S
+        prob = (1 - mask_rate) * F.one_hot(v_1, S).float() + mask_rate / S
         return torch.distributions.Categorical(prob).sample()
 
     def get_sigma_schedule(self, num_steps, device, scheduler='log_uniform'):
@@ -670,7 +665,7 @@ class ScorePosNet3D(nn.Module):
             loss_v = scatter_mean(loss_v, batch_ligand, dim=0).mean()
 
             loss = loss_pos + self.loss_v_weight * loss_v
-            loss_pos, loss_v, loss = loss_pos /10, loss_v / 10, loss / 10
+            # loss_pos, loss_v, loss = loss_pos / 10, loss_v / 10, loss / 10
             return {
                 'loss_pos': loss_pos,
                 'loss_v': loss_v,
@@ -853,7 +848,7 @@ class ScorePosNet3D(nn.Module):
         mask_rate_next = self.dfm_scheduler.mask_rate(sigma_next)[batch_ligand]
 
         # dt 采用 mask_rate 的差值，保证为正
-        dt = (mask_rate - mask_rate_next)
+        dt = sigma_i[batch_ligand] - sigma_next[batch_ligand]
 
         # 当前状态和网络预测的干净分布
         X_t = F.one_hot(ligand_v, num_classes=S).float()
@@ -910,7 +905,7 @@ class ScorePosNet3D(nn.Module):
         alpha_t_next = t_next.clamp(min=0.0, max=1.0 - 1e-6)
         alpha_t_prime = (alpha_t_next - alpha_t) / dt.clamp(min=1e-12)
 
-        stochasticity = getattr(self.config, 'campbell_stochasticity', 1.0)
+        stochasticity = getattr(self.config, 'campbell_stochasticity', 2.0)
         stochasticity = float(stochasticity)/self.dfm_scheduler.mask_rate_derivative(sigma_i)
         stochasticity = stochasticity[batch_ligand]
 
@@ -1036,21 +1031,51 @@ class ScorePosNet3D(nn.Module):
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + Exact DFM with Predictor-Corrector (v) ===
             device = protein_pos.device
-            n_dfm = getattr(self, 'dfm_num_steps', 100)  # N=100 per VEDA_DFM.md
             time_scheduler = getattr(self.config, 'time_scheduler', 'log_uniform')
             print(f"time_scheduler: {time_scheduler}, rho: {self.rho}")
-            sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
+            sigma_schedule = self.get_sigma_schedule(self.num_timesteps, device, time_scheduler)
             # DFM: t in [0, t_max] for kappa(t)=t/(t+1)
             # Training: t=0 (clean, kappa=0) -> t=t_max (noise, kappa->1)
             # Sampling: Reverse direction, from noise (t=t_max) to clean (t=0)
             beta = self.dfm_beta
             S = self.num_classes
             eps = 1e-5
-
-            for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
+            noise_injection = False
+            noise_injection_rate = 0
+            noise_injection_high_threshold = 5
+            noise_injection_low_threshold = 0.1
+            for step in tqdm(range(self.num_timesteps), desc='sampling', total=self.num_timesteps):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
                 sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)
-
+                if (sigma_i < noise_injection_high_threshold).all() and (sigma_i > noise_injection_low_threshold).all() and noise_injection:
+                    # 保存原始sigma_i用于计算噪声
+                    sigma_i_original = sigma_i.clone()
+                    # 增大sigma_i，使其更noisy
+                    sigma_i = (1 + noise_injection_rate) * sigma_i
+                    
+                    # 计算位置噪声：根据增大后的sigma_i添加合理的高斯噪声
+                    # 噪声尺度应该与sigma_i成正比，确保与扩散过程一致
+                    sigma_per_atom_original = sigma_i_original[batch_ligand]
+                    sigma_per_atom_new = sigma_i[batch_ligand]
+                    # 添加与sigma变化一致的噪声
+                    noise_scale = torch.sqrt((sigma_per_atom_new**2 - sigma_per_atom_original**2).clamp(min=0))
+                    # _, noise_injection_pos, _ = center_pos(
+                        # protein_pos, torch.randn_like(ligand_pos), batch_protein, batch_ligand, mode=center_pos_mode)
+                    noise_injection_pos = torch.randn_like(ligand_pos)
+                    noise_injection_pos -= scatter_mean(noise_injection_pos, batch_ligand, dim=0)[batch_ligand]
+                    ligand_pos = ligand_pos + noise_injection_pos * noise_scale
+                    
+                    # 更新离散特征：根据mask_rate的变化来mask更多原子
+                    mask_rate_original = self.dfm_scheduler.mask_rate(sigma_i_original)[batch_ligand]
+                    mask_rate_new = self.dfm_scheduler.mask_rate(sigma_i)[batch_ligand]
+                    mask_rate_diff = ((mask_rate_new - mask_rate_original)/(1-mask_rate_original).clamp(min=1e-5)).clamp(min=0).squeeze(-1)  # (N_atoms,)
+                    # 对每个原子，根据mask_rate_diff的概率进行mask
+                    mask_probs = torch.rand(ligand_v.shape[0], device=ligand_v.device)
+                    mask_mask = mask_probs < mask_rate_diff
+                    if mask_mask.any():
+                        # 为每个被mask的原子采样新的类别
+                        num_masked = mask_mask.sum().item()
+                        ligand_v[mask_mask] = torch.distributions.Categorical(probs=self.prior_dist).sample((num_masked,)).to(ligand_v.device)
 
                 preds = self(
                     protein_pos=protein_pos,
@@ -1075,12 +1100,12 @@ class ScorePosNet3D(nn.Module):
                 # 位置在 step 内部、更新完 ligand_pos 之后
                 ligand_pos = ligand_pos + step_size * d_i
                 
-                # if getattr(self.config, 'dfm_type', 'gat') == 'campbell':
-                #     discrete_update = self.campbell_dfm_step
-                # else:
-                #     discrete_update = self.gat_dfm_step
+                if getattr(self.config, 'dfm_type', 'gat') == 'campbell':
+                    discrete_update = self.campbell_dfm_step
+                else:
+                    discrete_update = self.gat_dfm_step
                 if not pos_only:
-                    ligand_v, p_step, p_1_given_t = self.campbell_dfm_step(
+                    ligand_v, p_step, p_1_given_t = discrete_update(
                         ligand_v=ligand_v,
                         pred_ligand_v=pred_ligand_v,
                         sigma_i=sigma_i,

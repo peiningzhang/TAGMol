@@ -96,38 +96,35 @@ class DFMTimeScheduler:
     kappa_0=0, kappa -> 1 as sigma -> +inf.
     """
 
-    def __init__(self, sigma_data=0.5):
+    def __init__(self, sigma_data=0.5, sigma_min=0.001, sigma_max=800, mask_mode='uniform'):
         self.sigma_data = sigma_data
-
-    # def kappa(self, sigma):
-    #     """Interpolation coefficient kappa = sigma / (sigma + sigma_data)."""
-    #     denom = sigma + self.sigma_data
-    #     if isinstance(sigma, torch.Tensor):
-    #         return sigma / denom
-    #     return sigma / denom
-
-    # def d_kappa_dt(self, sigma):
-    #     """Derivative d(kappa)/d(sigma) = sigma_data / (sigma + sigma_data)^2."""
-    #     denom = (sigma + self.sigma_data) ** 2
-    #     if isinstance(sigma, torch.Tensor):
-    #         return (torch.full_like(sigma, self.sigma_data, dtype=sigma.dtype, device=sigma.device) / denom)
-    #     return self.sigma_data / denom
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        print(f"sigma_data: {sigma_data}")
+        self.mask_mode = mask_mode
     def mask_rate(self, sigma):
         """Mask rate = sigma / (sigma + sigma_data)."""
-        return sigma / (sigma + self.sigma_data)
+        if self.mask_mode == 'edm':        
+            return sigma / (sigma + self.sigma_data)
+        elif self.mask_mode == 'uniform':
+            return torch.ones_like(sigma) * (torch.log(sigma) - np.log(self.sigma_min)) / (np.log(self.sigma_max) - np.log(self.sigma_min))
+        else:
+            raise ValueError(f"Invalid mask mode: {self.mask_mode}")
     def mask_rate_derivative(self, sigma):
         """Derivative of mask rate with respect to sigma."""
-        return 1 / (sigma + self.sigma_data)**2
+        if self.mask_mode == 'edm':
+            return self.sigma_data / (sigma + self.sigma_data)**2
+        elif self.mask_mode == 'uniform':
+            return torch.ones_like(sigma) / ((np.log(self.sigma_max) - np.log(self.sigma_min)) * sigma) 
+        else:
+            raise ValueError(f"Invalid mask mode: {self.mask_mode}")
     def kappa(self, sigma):
         """Interpolation coefficient mask_rate = sigma / (sigma + sigma_data)."""
-        mask_rate = sigma / (sigma + self.sigma_data)
-        if isinstance(sigma, torch.Tensor):
-            return (1 - mask_rate)**2
+        mask_rate = self.mask_rate(sigma)
         return (1 - mask_rate)**2
 
     def d_kappa_dt(self, sigma):
         """Derivative d(kappa)/d(sigma) = 2 * (1 - mask_rate) * mask_rate."""
-        mask_rate = sigma / (sigma + self.sigma_data)
-        if isinstance(sigma, torch.Tensor):
-            return 2 * (1 - mask_rate)
-        return 2 * (1 - mask_rate)
+        mask_rate = self.mask_rate(sigma)
+        mask_rate_derivative = self.mask_rate_derivative(sigma)
+        return 2 * (1 - mask_rate) * mask_rate_derivative
