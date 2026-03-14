@@ -1039,6 +1039,7 @@ class ScorePosNet3D(nn.Module):
             # Training: t=0 (clean, kappa=0) -> t=t_max (noise, kappa->1)
             # Sampling: Reverse direction, from noise (t=t_max) to clean (t=0)
             S = self.num_classes
+            n_dfm = self.num_timesteps
             eps = 1e-5
             noise_injection = False
             noise_injection_rate = 0
