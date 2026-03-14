@@ -303,23 +303,48 @@ class DockGuideNet3D(nn.Module):
         self.problem_type = config.get("problem_type", "regression")
         assert self.problem_type in ["regression", "classification"], f"`problem_type` should be 'regression' or 'classification'. Got: {self.problem_type}"
 
+        # EDM parameters (for VEDA mode - sigma-based time embedding, consistent with ScorePosNet3D)
+        self.sigma_data = getattr(config, 'sigma_data', 0.5)
+        self.sigma_min = getattr(config, 'sigma_min', 0.002)
+        self.sigma_max = getattr(config, 'sigma_max', 80.0)
+
+    def get_edm_scaling(self, sigma):
+        """EDM scaling: c_noise for time embedding (Karras et al.)."""
+        sigma_data = self.sigma_data
+        c_noise = torch.log(sigma.clamp(min=1e-12)) / 4
+        return c_noise
+
     def forward(self, protein_pos, protein_atom_feature, ligand_pos, ligand_atom_feature, batch_protein, batch_ligand,
-                time_step, return_all=False, fix_x=False):
+                time_step=None, sigma=None, return_all=False, fix_x=False):
+        """Forward pass. Use sigma (VEDA) or time_step (DDPM). Exactly one must be provided."""
+        assert (sigma is not None) != (time_step is not None), "Provide either sigma (VEDA) or time_step (DDPM), not both or neither."
         batch_size = batch_protein.max().item() + 1
         # time embedding
-        ## added to inform the model about the extent of noise that has been added
+        ## VEDA: c_noise from sigma (consistent with ScorePosNet3D)
+        ## DDPM: time_step / num_timesteps or sin(time_step)
         if self.time_emb_dim > 0:
-            if self.time_emb_mode == 'simple':
-                input_ligand_feat = torch.cat([
-                    ligand_atom_feature,
-                    (time_step / self.num_timesteps)[batch_ligand].unsqueeze(-1)
-                ], -1)
-            elif self.time_emb_mode == 'sin':
-                time_feat = self.time_emb(time_step)
-                time_feat = time_feat[batch_ligand]
+            if sigma is not None:
+                # VEDA mode: use c_noise = log(sigma)/4 for time embedding (consistent with ScorePosNet3D)
+                sigma_per_atom = sigma[batch_ligand] if sigma.dim() >= 2 else sigma[batch_ligand]
+                if sigma_per_atom.dim() > 1:
+                    sigma_per_atom = sigma_per_atom.squeeze(-1)
+                c_noise = self.get_edm_scaling(sigma_per_atom)
+                time_emb_input = c_noise.squeeze(-1) if c_noise.dim() > 1 else c_noise
+                time_feat = self.time_emb(time_emb_input)
                 input_ligand_feat = torch.cat([ligand_atom_feature, time_feat], -1)
             else:
-                raise NotImplementedError
+                # DDPM mode: use time_step
+                if self.time_emb_mode == 'simple':
+                    input_ligand_feat = torch.cat([
+                        ligand_atom_feature,
+                        (time_step / self.num_timesteps)[batch_ligand].unsqueeze(-1)
+                    ], -1)
+                elif self.time_emb_mode == 'sin':
+                    time_feat = self.time_emb(time_step)
+                    time_feat = time_feat[batch_ligand]
+                    input_ligand_feat = torch.cat([ligand_atom_feature, time_feat], -1)
+                else:
+                    raise NotImplementedError
         else:
             input_ligand_feat = ligand_atom_feature
 
@@ -455,7 +480,6 @@ class DockGuideNet3D(nn.Module):
             protein_pos=protein_pos,
             protein_atom_feature=protein_v,
             batch_protein=batch_protein,
-
             ligand_pos=ligand_pos_perturbed,
             ligand_atom_feature=F.one_hot(ligand_v_perturbed, self.num_classes),
             batch_ligand=batch_ligand,
@@ -476,8 +500,9 @@ class DockGuideNet3D(nn.Module):
         else:
             return loss
 
-    def get_gradients_guide(self, protein_pos, protein_atom_feature, ligand_pos, ligand_atom_feature, batch_protein, batch_ligand, time_step, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
-        ## get the gradients w.r.t ligand position and features using the Binding-affinity EGNN predictor
+    def get_gradients_guide(self, protein_pos, protein_atom_feature, ligand_pos, ligand_atom_feature, batch_protein, batch_ligand, time_step=None, sigma=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
+        """Get gradients for classifier guidance. Use sigma (VEDA) or time_step (DDPM). Exactly one must be provided."""
+        assert (sigma is not None) != (time_step is not None), "Provide either sigma (VEDA) or time_step (DDPM), not both or neither."
         self.eval()
         self.zero_grad()
         with torch.enable_grad(): ## needed during inference
@@ -492,6 +517,7 @@ class DockGuideNet3D(nn.Module):
                 batch_protein=batch_protein,
                 batch_ligand=batch_ligand,
                 time_step=time_step,
+                sigma=sigma,
                 fix_x=True
             )
             if self.problem_type not in ("classification", ):

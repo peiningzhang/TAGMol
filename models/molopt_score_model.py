@@ -1031,9 +1031,10 @@ class ScorePosNet3D(nn.Module):
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + Exact DFM with Predictor-Corrector (v) ===
             device = protein_pos.device
+            n_dfm = self.num_timesteps
             time_scheduler = getattr(self.config, 'time_scheduler', 'log_uniform')
             print(f"time_scheduler: {time_scheduler}, rho: {self.rho}")
-            sigma_schedule = self.get_sigma_schedule(self.num_timesteps, device, time_scheduler)
+            sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
             # DFM: t in [0, t_max] for kappa(t)=t/(t+1)
             # Training: t=0 (clean, kappa=0) -> t=t_max (noise, kappa->1)
             # Sampling: Reverse direction, from noise (t=t_max) to clean (t=0)
@@ -1043,7 +1044,7 @@ class ScorePosNet3D(nn.Module):
             noise_injection_rate = 0
             noise_injection_high_threshold = 5
             noise_injection_low_threshold = 0.1
-            for step in tqdm(range(self.num_timesteps), desc='sampling', total=self.num_timesteps):
+            for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
                 sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)
                 if (sigma_i < noise_injection_high_threshold).all() and (sigma_i > noise_injection_low_threshold).all() and noise_injection:
@@ -1216,10 +1217,106 @@ class ScorePosNet3D(nn.Module):
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
         if self.diffusion_type == 'veda':
-            raise NotImplementedError(
-                "Guided sampling for VEDA is not yet implemented. Use sample_diffusion for unguided sampling, "
-                "or use diffusion_type='ddpm' for guided sampling."
-            )
+            # === VEDA: EDM (pos) + DFM (v) with classifier guidance via sigma ===
+            if num_steps is None:
+                num_steps = self.num_timesteps
+            num_graphs = batch_protein.max().item() + 1
+            device = protein_pos.device
+            n_dfm = num_steps
+            time_scheduler = getattr(self.config, 'time_scheduler', 'log_uniform')
+            sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
+            S = self.num_classes
+            eps = 1e-5
+
+            protein_pos, init_ligand_pos, offset = center_pos(
+                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
+
+            pos_traj, v_traj = [], []
+            v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
+            ligand_pos, ligand_v = init_ligand_pos * self.sigma_max, init_ligand_v
+
+            discrete_update = self.campbell_dfm_step if getattr(self.config, 'dfm_type', 'gat') == 'campbell' else self.gat_dfm_step
+
+            for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
+                sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
+                sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)
+
+                with torch.no_grad():
+                    preds = self(
+                        protein_pos=protein_pos,
+                        protein_v=protein_v,
+                        batch_protein=batch_protein,
+                        init_ligand_pos=ligand_pos,
+                        init_ligand_v=ligand_v,
+                        batch_ligand=batch_ligand,
+                        sigma=sigma_i
+                    )
+                pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
+
+                sigma_per_atom = sigma_i[batch_ligand]
+                sigma_next_per_atom = sigma_next[batch_ligand]
+                c_skip, c_out, _, _ = self.get_edm_scaling(sigma_per_atom)
+                D_theta = c_skip * ligand_pos + c_out * pred_ligand_pos
+
+                step_size = sigma_next_per_atom - sigma_per_atom
+                d_i = (ligand_pos - D_theta) / sigma_per_atom.clamp(min=1e-12)
+
+                # Classifier guidance: pass sigma to guide (VEDA mode)
+                grad_result = guide_model.get_gradients_guide(
+                    protein_pos=protein_pos,
+                    protein_atom_feature=protein_v,
+                    ligand_pos=ligand_pos,
+                    ligand_atom_feature=F.one_hot(ligand_v, self.num_classes).float(),
+                    batch_protein=batch_protein,
+                    batch_ligand=batch_ligand,
+                    sigma=sigma_i,
+                    pos_only=pos_only,
+                    clamp_pred_min=clamp_pred_min,
+                    clamp_pred_max=clamp_pred_max,
+                )
+                ligand_pos_grad = grad_result if pos_only else grad_result[0]
+                ligand_v_grad = None if pos_only else grad_result[1]
+
+                # Euler step with gradient guidance (scale by sigma, analogous to DDPM's pos_log_variance)
+                ligand_pos_grad_update = gradient_scale_cord * ligand_pos_grad * sigma_per_atom
+                ligand_pos = ligand_pos + step_size * d_i - ligand_pos_grad_update
+
+                if not pos_only:
+                    ligand_v, p_step, p_1_given_t = discrete_update(
+                        ligand_v=ligand_v,
+                        pred_ligand_v=pred_ligand_v,
+                        sigma_i=sigma_i,
+                        sigma_next=sigma_next,
+                        batch_ligand=batch_ligand,
+                        eps=eps,
+                    )
+                    if gradient_scale_categ != 0 and ligand_v_grad is not None:
+                        updated_prob = F.softmax(pred_ligand_v, dim=-1) - gradient_scale_categ * ligand_v_grad
+                        updated_prob = updated_prob.clamp(min=1e-9)
+                        updated_prob = updated_prob / updated_prob.sum(dim=-1, keepdim=True)
+                        ligand_v = torch.distributions.Categorical(probs=updated_prob).sample()
+                    v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
+                    vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
+
+                ori_ligand_pos0 = D_theta + offset[batch_ligand]
+                ori_ligand_pos = ligand_pos + offset[batch_ligand]
+                pos0_traj.append(ori_ligand_pos0.clone().cpu())
+                pos_traj.append(ori_ligand_pos.clone().cpu())
+                v_traj.append(ligand_v.clone().cpu())
+
+            ligand_pos = D_theta
+            ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
+            ligand_pos = ligand_pos + offset[batch_ligand]
+            return {
+                'pos': ligand_pos,
+                'v': ligand_v,
+                'pos_traj': pos_traj,
+                'pos0_traj': pos0_traj,
+                'v_traj': v_traj,
+                'v0_traj': v0_pred_traj,
+                'vt_traj': vt_pred_traj
+            }
+
         elif self.diffusion_type == 'ddpm':
             if num_steps is None:
                 num_steps = self.num_timesteps
@@ -1351,15 +1448,125 @@ class ScorePosNet3D(nn.Module):
     def sample_multi_guided_diffusion(self, guide_models, guide_configs, n_data, device, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False):
-        if self.diffusion_type == 'veda':
-            raise NotImplementedError(
-                "Multi-guided sampling for VEDA is not yet implemented. Use sample_diffusion for unguided sampling."
-            )
         assert len(guide_models) == len(guide_configs), f"guide_models and guide_configs must have the same length"
         if self.diffusion_type == 'veda':
-            raise NotImplementedError(
-                "Multi-guided sampling for VEDA is not yet implemented. Use sample_diffusion for unguided sampling."
-            )
+            # === VEDA: EDM (pos) + DFM (v) with multi-classifier guidance via sigma ===
+            if num_steps is None:
+                num_steps = self.num_timesteps
+            num_graphs = batch_protein.max().item() + 1
+            n_dfm = num_steps
+            time_scheduler = getattr(self.config, 'time_scheduler', 'log_uniform')
+            sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
+            S = self.num_classes
+            eps = 1e-5
+
+            protein_pos, init_ligand_pos, offset = center_pos(
+                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
+
+            pos_traj, v_traj = [], []
+            v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
+            ligand_pos, ligand_v = init_ligand_pos * self.sigma_max, init_ligand_v
+
+            discrete_update = self.campbell_dfm_step if getattr(self.config, 'dfm_type', 'gat') == 'campbell' else self.gat_dfm_step
+
+            for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
+                sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
+                sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)
+
+                with torch.no_grad():
+                    preds = self(
+                        protein_pos=protein_pos,
+                        protein_v=protein_v,
+                        batch_protein=batch_protein,
+                        init_ligand_pos=ligand_pos,
+                        init_ligand_v=ligand_v,
+                        batch_ligand=batch_ligand,
+                        sigma=sigma_i
+                    )
+                pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
+
+                sigma_per_atom = sigma_i[batch_ligand]
+                sigma_next_per_atom = sigma_next[batch_ligand]
+                c_skip, c_out, _, _ = self.get_edm_scaling(sigma_per_atom)
+                D_theta = c_skip * ligand_pos + c_out * pred_ligand_pos
+
+                step_size = sigma_next_per_atom - sigma_per_atom
+                d_i = (ligand_pos - D_theta) / sigma_per_atom.clamp(min=1e-12)
+
+                # Multi-classifier guidance: pass sigma to each guide (VEDA mode)
+                ligand_pos_grad, ligand_v_grad = None, None
+                for guide_model, guide_config in zip(guide_models, guide_configs):
+                    guide_weight = guide_config.weight
+                    gradient_scale_cord = guide_config.gradient_scale_cord
+                    gradient_scale_categ = guide_config.gradient_scale_categ
+                    clamp_pred_min = guide_config.get("clamp_pred_min", None)
+                    clamp_pred_max = guide_config.get("clamp_pred_max", None)
+
+                    grad_result = guide_model.get_gradients_guide(
+                        protein_pos=protein_pos,
+                        protein_atom_feature=protein_v,
+                        ligand_pos=ligand_pos,
+                        ligand_atom_feature=F.one_hot(ligand_v, self.num_classes).float(),
+                        batch_protein=batch_protein,
+                        batch_ligand=batch_ligand,
+                        sigma=sigma_i,
+                        pos_only=pos_only,
+                        clamp_pred_min=clamp_pred_min,
+                        clamp_pred_max=clamp_pred_max,
+                    )
+                    curr_ligand_pos_grad = grad_result if pos_only else grad_result[0]
+                    curr_ligand_v_grad = None if pos_only else grad_result[1]
+
+                    if ligand_pos_grad is None:
+                        ligand_pos_grad = guide_weight * gradient_scale_cord * curr_ligand_pos_grad
+                    else:
+                        ligand_pos_grad += guide_weight * gradient_scale_cord * curr_ligand_pos_grad
+                    if gradient_scale_categ != 0 and curr_ligand_v_grad is not None:
+                        if ligand_v_grad is None:
+                            ligand_v_grad = guide_weight * gradient_scale_categ * curr_ligand_v_grad
+                        else:
+                            ligand_v_grad += guide_weight * gradient_scale_categ * curr_ligand_v_grad
+
+                # Euler step with gradient guidance
+                ligand_pos_grad_update = ligand_pos_grad * sigma_per_atom
+                ligand_pos = ligand_pos + step_size * d_i - ligand_pos_grad_update
+
+                if not pos_only:
+                    ligand_v, p_step, p_1_given_t = discrete_update(
+                        ligand_v=ligand_v,
+                        pred_ligand_v=pred_ligand_v,
+                        sigma_i=sigma_i,
+                        sigma_next=sigma_next,
+                        batch_ligand=batch_ligand,
+                        eps=eps,
+                    )
+                    if ligand_v_grad is not None:
+                        updated_prob = F.softmax(pred_ligand_v, dim=-1) - ligand_v_grad
+                        updated_prob = updated_prob.clamp(min=1e-9)
+                        updated_prob = updated_prob / updated_prob.sum(dim=-1, keepdim=True)
+                        ligand_v = torch.distributions.Categorical(probs=updated_prob).sample()
+                    v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
+                    vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
+
+                ori_ligand_pos0 = D_theta + offset[batch_ligand]
+                ori_ligand_pos = ligand_pos + offset[batch_ligand]
+                pos0_traj.append(ori_ligand_pos0.clone().cpu())
+                pos_traj.append(ori_ligand_pos.clone().cpu())
+                v_traj.append(ligand_v.clone().cpu())
+
+            ligand_pos = D_theta
+            ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
+            ligand_pos = ligand_pos + offset[batch_ligand]
+            return {
+                'pos': ligand_pos,
+                'v': ligand_v,
+                'pos_traj': pos_traj,
+                'pos0_traj': pos0_traj,
+                'v_traj': v_traj,
+                'v0_traj': v0_pred_traj,
+                'vt_traj': vt_pred_traj
+            }
+
         if num_steps is None:
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
