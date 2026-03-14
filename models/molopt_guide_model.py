@@ -7,6 +7,7 @@ from tqdm.auto import tqdm
 
 from models.common import compose_context, ShiftedSoftplus
 from models.egnn import EGNN
+from utils.misc import DFMTimeScheduler
 
 
 def get_refine_net(refine_net_type, config):
@@ -303,32 +304,62 @@ class DockGuideNet3D(nn.Module):
         self.problem_type = config.get("problem_type", "regression")
         assert self.problem_type in ["regression", "classification"], f"`problem_type` should be 'regression' or 'classification'. Got: {self.problem_type}"
 
-        # EDM parameters (for VEDA mode - sigma-based time embedding, consistent with ScorePosNet3D)
+        # Diffusion type: veda (EDM+DFM) or ddpm (legacy)
+        self.diffusion_type = getattr(config, 'diffusion_type', 'ddpm')
+
+        # EDM parameters (for VEDA mode - sigma-based, consistent with ScorePosNet3D)
         self.sigma_data = getattr(config, 'sigma_data', 0.5)
         self.sigma_min = getattr(config, 'sigma_min', 0.002)
         self.sigma_max = getattr(config, 'sigma_max', 80.0)
+        self.rho = getattr(config, 'rho', 7.0)
+
+        # DFM scheduler for VEDA discrete noising
+        if self.diffusion_type == 'veda':
+            mask_mode = getattr(config, 'mask_mode', 'uniform')
+            self.dfm_scheduler = DFMTimeScheduler(
+                sigma_data=self.sigma_data,
+                sigma_min=self.sigma_min,
+                sigma_max=self.sigma_max,
+                mask_mode=mask_mode
+            )
 
     def get_edm_scaling(self, sigma):
-        """EDM scaling: c_noise for time embedding (Karras et al.)."""
+        """EDM scaling coefficients: c_skip, c_out, c_in, c_noise (Karras et al.)."""
         sigma_data = self.sigma_data
+        c_skip = sigma_data ** 2 / (sigma ** 2 + sigma_data ** 2)
+        c_out = sigma * sigma_data / (sigma ** 2 + sigma_data ** 2) ** 0.5
+        c_in = 1 / (sigma ** 2 + sigma_data ** 2) ** 0.5
         c_noise = torch.log(sigma.clamp(min=1e-12)) / 4
-        return c_noise
+        return c_skip, c_out, c_in, c_noise
+
+    def sample_discrete_dfm_noise(self, v_1, sigma, batch):
+        """VEDA DFM: sample v_t from P(v_t|v_1) = kappa_t * OneHot(v_1) + (1-kappa_t) / S."""
+        mask_rate = self.dfm_scheduler.mask_rate(sigma)
+        if mask_rate.dim() == 1 and len(mask_rate) == batch.max().item() + 1:
+            mask_rate = mask_rate[batch].unsqueeze(-1)
+        elif mask_rate.dim() == 1:
+            mask_rate = mask_rate.unsqueeze(-1)
+        S = self.num_classes
+        prob = (1 - mask_rate) * F.one_hot(v_1, S).float() + mask_rate / S
+        return torch.distributions.Categorical(prob).sample()
 
     def forward(self, protein_pos, protein_atom_feature, ligand_pos, ligand_atom_feature, batch_protein, batch_ligand,
                 time_step=None, sigma=None, return_all=False, fix_x=False):
         """Forward pass. Use sigma (VEDA) or time_step (DDPM). Exactly one must be provided."""
         assert (sigma is not None) != (time_step is not None), "Provide either sigma (VEDA) or time_step (DDPM), not both or neither."
         batch_size = batch_protein.max().item() + 1
+        pos_ligand_for_net = ligand_pos
+        if sigma is not None:
+            sigma_per_atom = sigma[batch_ligand] if sigma.dim() >= 2 else sigma[batch_ligand]
+            if sigma_per_atom.dim() > 1:
+                sigma_per_atom = sigma_per_atom.squeeze(-1)
+            _, _, c_in, c_noise = self.get_edm_scaling(sigma_per_atom)
+            pos_ligand_for_net = c_in.unsqueeze(-1) * ligand_pos if c_in.dim() == 1 else c_in * ligand_pos
         # time embedding
         ## VEDA: c_noise from sigma (consistent with ScorePosNet3D)
         ## DDPM: time_step / num_timesteps or sin(time_step)
         if self.time_emb_dim > 0:
             if sigma is not None:
-                # VEDA mode: use c_noise = log(sigma)/4 for time embedding (consistent with ScorePosNet3D)
-                sigma_per_atom = sigma[batch_ligand] if sigma.dim() >= 2 else sigma[batch_ligand]
-                if sigma_per_atom.dim() > 1:
-                    sigma_per_atom = sigma_per_atom.squeeze(-1)
-                c_noise = self.get_edm_scaling(sigma_per_atom)
                 time_emb_input = c_noise.squeeze(-1) if c_noise.dim() > 1 else c_noise
                 time_feat = self.time_emb(time_emb_input)
                 input_ligand_feat = torch.cat([ligand_atom_feature, time_feat], -1)
@@ -353,7 +384,7 @@ class DockGuideNet3D(nn.Module):
             init_ligand_h = torch.cat([init_ligand_h, torch.ones(len(init_ligand_h), 1).to(init_ligand_h.device)], -1)
         
         if self.drop_protein_in_guide is True:
-            h_all, pos_all, batch_all = init_ligand_h, ligand_pos, batch_ligand
+            h_all, pos_all, batch_all = init_ligand_h, pos_ligand_for_net, batch_ligand
             # TODO: check `mask_ligand`
             mask_ligand = torch.ones([batch_ligand.size(0)], device=batch_ligand.device).bool()
         else:
@@ -366,7 +397,7 @@ class DockGuideNet3D(nn.Module):
                 h_protein=h_protein,
                 h_ligand=init_ligand_h,
                 pos_protein=protein_pos,
-                pos_ligand=ligand_pos,
+                pos_ligand=pos_ligand_for_net,
                 batch_protein=batch_protein,
                 batch_ligand=batch_ligand,
             )
@@ -453,29 +484,66 @@ class DockGuideNet3D(nn.Module):
         protein_pos, ligand_pos, _ = center_pos(
             protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode)
 
-        # 1. sample noise levels
+        if self.diffusion_type == 'veda':
+            # === VEDA: EDM (pos) + DFM (v) noising ===
+            device = protein_pos.device
+            if time_step is None:
+                # Training: sigma ~ LogNormal(P_mean, P_std^2)
+                P_mean = getattr(self.config, 'edm_p_mean', -1.2)
+                P_std = getattr(self.config, 'edm_p_std', 1.2)
+                rnd_normal = torch.randn(num_graphs, device=device)
+                sigma = (rnd_normal * P_std + P_mean).exp()
+                sigma = sigma.clamp(self.sigma_min, self.sigma_max)
+            else:
+                # Validation: map time_step to sigma (log_uniform)
+                timestep_ratio = time_step.float() / (self.num_timesteps - 1)
+                log_sigma_max = torch.log(torch.tensor(self.sigma_max, device=device))
+                log_sigma_min = torch.log(torch.tensor(self.sigma_min, device=device))
+                log_sigma = log_sigma_max + timestep_ratio * (log_sigma_min - log_sigma_max)
+                sigma = torch.exp(log_sigma)
+
+            sigma_per_atom = sigma[batch_ligand].unsqueeze(-1)
+            pos_noise = torch.randn_like(ligand_pos, device=device)
+            ligand_pos_perturbed = ligand_pos + sigma_per_atom * pos_noise
+            ligand_v_perturbed = self.sample_discrete_dfm_noise(ligand_v, sigma_per_atom, batch_ligand)
+
+            preds = self(
+                protein_pos=protein_pos,
+                protein_atom_feature=protein_v,
+                batch_protein=batch_protein,
+                ligand_pos=ligand_pos_perturbed,
+                ligand_atom_feature=F.one_hot(ligand_v_perturbed, self.num_classes),
+                batch_ligand=batch_ligand,
+                sigma=sigma,
+                fix_x=True
+            )
+
+            if self.problem_type == "regression":
+                loss_func = nn.MSELoss()
+                loss = loss_func(preds.view(-1), dock)
+            elif self.problem_type == "classification":
+                loss_func = nn.BCEWithLogitsLoss()
+                loss = loss_func(preds.view(-1), dock.float())
+            else:
+                raise ValueError(f"Unknown problem type: {self.problem_type}")
+            if return_pred:
+                return loss, preds
+            return loss
+
+        # === DDPM (legacy) ===
         if time_step is None:
             time_step, pt = self.sample_time(num_graphs, protein_pos.device, self.sample_time_method)
         else:
             pt = torch.ones_like(time_step).float() / self.num_timesteps
-        ## precomputed beforehand to save computational time. Here it is only indexed based on the time_step
-        a = self.alphas_cumprod.index_select(0, time_step)  # (num_graphs, )
+        a = self.alphas_cumprod.index_select(0, time_step)
 
-        # 2. perturb pos and v
-        a_pos = a[batch_ligand].unsqueeze(-1)  # (num_ligand_atoms, 1)
-        ## sampling a normal distribution to add as noise
+        a_pos = a[batch_ligand].unsqueeze(-1)
         pos_noise = torch.zeros_like(ligand_pos)
         pos_noise.normal_()
-        ## update the coordinates
-        # Xt = a.sqrt() * X0 + (1-a).sqrt() * eps
-        ligand_pos_perturbed = a_pos.sqrt() * ligand_pos + (1.0 - a_pos).sqrt() * pos_noise  # pos_noise * std
-        ## update the categories
-        # Vt = a * V0 + (1-a) / K
+        ligand_pos_perturbed = a_pos.sqrt() * ligand_pos + (1.0 - a_pos).sqrt() * pos_noise
         log_ligand_v0 = index_to_log_onehot(ligand_v, self.num_classes)
-        ## move some of the probablity mass to other indexes
         ligand_v_perturbed, log_ligand_vt = self.q_v_sample(log_ligand_v0, time_step, batch_ligand)
 
-        # 3. forward-pass NN, feed perturbed pos and v, output noise
         preds = self(
             protein_pos=protein_pos,
             protein_atom_feature=protein_v,
@@ -497,8 +565,7 @@ class DockGuideNet3D(nn.Module):
             raise ValueError(f"Unknown problem type: {self.problem_type}")
         if return_pred:
             return loss, preds
-        else:
-            return loss
+        return loss
 
     def get_gradients_guide(self, protein_pos, protein_atom_feature, ligand_pos, ligand_atom_feature, batch_protein, batch_ligand, time_step=None, sigma=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
         """Get gradients for classifier guidance. Use sigma (VEDA) or time_step (DDPM). Exactly one must be provided."""
