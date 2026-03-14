@@ -430,7 +430,7 @@ if __name__ == '__main__':
                 }, last_ckpt_path)
                 logger.info(f'[Checkpoint] Saved last checkpoint to: {last_ckpt_path} (iter {it})')
             # Quick eval: sample + full metrics every quick_eval_freq steps, log to wandb
-            if (it % quick_eval_freq == 0) and not args.trial and use_wandb:
+            if (it % quick_eval_freq == 0) or (it == config.train.max_iters):
                 tmp_dir = tempfile.mkdtemp(prefix='train_quick_eval_', dir=log_dir)
                 try:
                     model.eval()
@@ -469,9 +469,11 @@ if __name__ == '__main__':
                         save=False,
                     )
                     eval_log = {f'eval/{k}': v for k, v in metrics.items() if v is not None}
-                    if eval_log:
+                    if eval_log and use_wandb:
                         wandb.log(eval_log)
                     logger.info('[QuickEval] Iter %d | %s' % (it, ' '.join('%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None)))
+                except Exception as e:
+                    print(e)
                 finally:
                     model.train()
                     if os.path.isdir(tmp_dir):
