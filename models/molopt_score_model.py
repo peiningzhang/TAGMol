@@ -433,7 +433,7 @@ class ScorePosNet3D(nn.Module):
                 raise NotImplementedError
             elif self.time_emb_mode == 'sin':
                 time_feat = self.time_emb(time_emb_input)
-                input_ligand_feat = torch.cat([init_ligand_v, time_feat[batch_ligand]], -1)
+                input_ligand_feat = torch.cat([init_ligand_v, time_feat], -1)
             else:
                 raise NotImplementedError
         else:
@@ -1006,7 +1006,8 @@ class ScorePosNet3D(nn.Module):
                         # 为每个被mask的原子采样新的类别
                         num_masked = mask_mask.sum().item()
                         ligand_v[mask_mask] = torch.distributions.Categorical(probs=self.prior_dist).sample((num_masked,)).to(ligand_v.device)
-                sigma_i = sigma_i[batch_ligand]
+                sigma_per_atom = sigma_i[batch_ligand]
+                sigma_next_per_atom = sigma_next[batch_ligand]
                 preds = self(
                     protein_pos=protein_pos,
                     protein_v=protein_v,
@@ -1014,13 +1015,9 @@ class ScorePosNet3D(nn.Module):
                     init_ligand_pos=ligand_pos,
                     init_ligand_v=ligand_v,
                     batch_ligand=batch_ligand,
-                    sigma=sigma_i
+                    sigma=sigma_per_atom
                 )
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
-
-                # EDM denoiser: D_theta = c_skip * x_t + c_out * F_theta
-                sigma_per_atom = sigma_i[batch_ligand]
-                sigma_next_per_atom = sigma_next[batch_ligand]
 
                 # Euler step for pos: d_i = (pos_i - D_theta) / sigma_i, pos_next = pos_i + dt * d_i
                 step_size = (sigma_next_per_atom - sigma_per_atom) # step_size is negative
