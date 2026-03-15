@@ -94,8 +94,8 @@ def main():
     parser.add_argument(
         "--protein_root",
         type=str,
-        default="./data/crossdocked_v1.1_rmsd1.0",
-        help="Protein root passed to evaluate_diffusion.py.",
+        default="./data/test_set",
+        help="Protein root for docking (dir containing PDB files). Use data/test_set if crossdocked path lacks pdbs.",
     )
     parser.add_argument(
         "--exhaustiveness",
@@ -226,7 +226,7 @@ def main():
     ]
     if args.docking_mode != "none":
         eval_cmd += ["--verbose", "True"]
-        protein_root = getattr(config.data, "path", args.protein_root) if hasattr(config, "data") else args.protein_root
+        protein_root = args.protein_root
         eval_cmd += [
             "--protein_root",
             protein_root,
