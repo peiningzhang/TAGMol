@@ -56,6 +56,8 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
     all_mol_stable, all_atom_stable, all_n_atom = 0, 0, 0
     n_recon_success, n_eval_success, n_complete = 0, 0, 0
     results = []
+    first_docking_error = [None]
+    _debug_first_sample_logged = [False]
     all_pair_dist, all_bond_dist = [], []
     success_pair_dist, success_atom_types = [], Counter()
     for example_idx, r_name in enumerate(tqdm(results_fn_list, desc='Eval')):
@@ -85,18 +87,32 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
             try:
                 chem_results = scoring_func.get_chem(mol)
                 data = r.get('data')
-                ligand_filename = getattr(data, 'ligand_filename', None) if data is not None else None
-                protein_filename = getattr(data, 'protein_filename', None) if data is not None else None
+                ligand_filename = r.get('ligand_filename')
+                protein_filename = r.get('protein_filename')
+                if ligand_filename is None or protein_filename is None:
+                    if data is not None:
+                        lf = data.get('ligand_filename', None) if isinstance(data, dict) else getattr(data, 'ligand_filename', None)
+                        pf = data.get('protein_filename', None) if isinstance(data, dict) else getattr(data, 'protein_filename', None)
+                        if ligand_filename is None:
+                            ligand_filename = lf
+                        if protein_filename is None:
+                            protein_filename = pf
+                if not _debug_first_sample_logged[0] and docking_mode != 'none':
+                    _debug_first_sample_logged[0] = True
+                    protein_path = os.path.join(protein_root, protein_filename) if protein_filename else None
+                    logger.info(f"[Docking debug] ligand_filename={ligand_filename!r}, protein_filename={protein_filename!r}, protein_path={protein_path!r}, exists={os.path.exists(protein_path) if protein_path else 'N/A'}")
                 if docking_mode == 'qvina':
                     if ligand_filename is None and protein_filename is None:
-                        raise ValueError("data must have ligand_filename or protein_filename for docking")
+                        data_keys = list(data.keys()) if isinstance(data, dict) else [k for k in dir(data) if not k.startswith('_')]
+                        raise ValueError(f"data must have ligand_filename or protein_filename for docking. data keys: {data_keys[:20]}")
                     vina_task = QVinaDockingTask.from_generated_mol(
                         mol, ligand_filename=ligand_filename, protein_root=protein_root,
                         protein_filename=protein_filename)
                     vina_results = vina_task.run_sync()
                 elif docking_mode in ['vina_score', 'vina_dock']:
                     if ligand_filename is None and protein_filename is None:
-                        raise ValueError("data must have ligand_filename or protein_filename for docking")
+                        data_keys = list(data.keys()) if isinstance(data, dict) else [k for k in dir(data) if not k.startswith('_')]
+                        raise ValueError(f"data must have ligand_filename or protein_filename for docking. data keys: {data_keys[:20]}")
                     vina_task = VinaDockingTask.from_generated_mol(
                         mol, ligand_filename=ligand_filename, protein_root=protein_root,
                         protein_filename=protein_filename)
@@ -110,6 +126,8 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                     vina_results = None
                 n_eval_success += 1
             except Exception as e:
+                if first_docking_error[0] is None:
+                    first_docking_error[0] = (r_name, e)
                 if verbose:
                     logger.info(f"Docking failed for sample: {e}")
                 continue
@@ -118,6 +136,12 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
             success_pair_dist += pair_dist
             success_atom_types += Counter(pred_atom_type)
             results.append({'mol': mol, 'smiles': smiles, 'chem_results': chem_results, 'vina': vina_results})
+
+    if docking_mode != 'none' and n_eval_success == 0 and first_docking_error[0] is not None:
+        r_name, err = first_docking_error[0]
+        msg = f"All docking failed (eval_success=0). First error from {os.path.basename(r_name)}: {err}"
+        logger.warning(msg)
+        print(msg, flush=True)
 
     fraction_mol_stable = all_mol_stable / num_samples if num_samples else 0.0
     fraction_atm_stable = all_atom_stable / all_n_atom if all_n_atom > 0 else 0.0

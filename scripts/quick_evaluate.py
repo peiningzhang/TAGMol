@@ -200,6 +200,9 @@ def main():
             "pred_ligand_v0_traj": pred_v0_traj,
             "time": time_list,
         }
+        if args.docking_mode != "none":
+            result["ligand_filename"] = getattr(data, "ligand_filename", None)
+            result["protein_filename"] = getattr(data, "protein_filename", None)
 
         out_path = os.path.join(tmp_dir, f"result_{data_id}.pt")
         torch.save(result, out_path)
@@ -222,6 +225,7 @@ def main():
         "--one_line",
     ]
     if args.docking_mode != "none":
+        eval_cmd += ["--verbose", "True"]
         protein_root = getattr(config.data, "path", args.protein_root) if hasattr(config, "data") else args.protein_root
         eval_cmd += [
             "--protein_root",
