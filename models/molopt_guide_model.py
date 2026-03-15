@@ -322,6 +322,8 @@ class DockGuideNet3D(nn.Module):
                 sigma_max=self.sigma_max,
                 mask_mode=mask_mode
             )
+        print("problem type: ", self.problem_type)
+
 
     def get_edm_scaling(self, sigma):
         """EDM scaling coefficients: c_skip, c_out, c_in, c_noise (Karras et al.)."""
@@ -517,10 +519,9 @@ class DockGuideNet3D(nn.Module):
                 sigma=sigma,
                 fix_x=True
             )
-
             if self.problem_type == "regression":
                 loss_func = nn.MSELoss()
-                loss = loss_func(preds.view(-1), dock)
+                loss = loss_func(preds.view(-1), dock)/100
             elif self.problem_type == "classification":
                 loss_func = nn.BCEWithLogitsLoss()
                 loss = loss_func(preds.view(-1), dock.float())
