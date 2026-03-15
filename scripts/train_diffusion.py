@@ -458,12 +458,14 @@ if __name__ == '__main__':
                             'time': time_list,
                         }
                         torch.save(result, os.path.join(tmp_dir, f'result_{data_id}.pt'))
+                    quick_eval_docking = getattr(config.train, 'quick_eval_docking_mode', 'vina_score')
+                    protein_root = config.data.path if hasattr(config.data, 'path') else './data/test_set'
                     metrics, _ = run_evaluation(
                         tmp_dir,
                         eval_step=-1,
                         eval_num_examples=n_pocket,
-                        docking_mode='none',
-                        protein_root=config.data.path if hasattr(config.data, 'path') else './data/crossdocked_v1.1_rmsd1.0',
+                        docking_mode=quick_eval_docking,
+                        protein_root=protein_root,
                         atom_enc_mode=config.data.transform.ligand_atom_mode,
                         verbose=False,
                         save=False,
@@ -471,7 +473,15 @@ if __name__ == '__main__':
                     eval_log = {f'eval/{k}': v for k, v in metrics.items() if v is not None}
                     if eval_log and use_wandb:
                         wandb.log(eval_log)
-                    logger.info('[QuickEval] Iter %d | %s' % (it, ' '.join('%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None)))
+                    log_parts = ['%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None]
+                    logger.info('[QuickEval] Iter %d | %s' % (it, ' '.join(log_parts)))
+                    # Vina Score / Vina Min (Mean, Median)
+                    vs_mean, vs_med = metrics.get('Vina_score_mean'), metrics.get('Vina_score_med')
+                    vm_mean, vm_med = metrics.get('Vina_min_mean'), metrics.get('Vina_min_med')
+                    if vs_mean is not None and vs_med is not None:
+                        logger.info('[QuickEval] Vina Score:  Mean: %.3f  Median: %.3f' % (vs_mean, vs_med))
+                    if vm_mean is not None and vm_med is not None:
+                        logger.info('[QuickEval] Vina Min  :  Mean: %.3f  Median: %.3f' % (vm_mean, vm_med))
                 except Exception as e:
                     print(e)
                 finally:

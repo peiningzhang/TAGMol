@@ -187,6 +187,17 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
     for k, v in success_js_metrics.items():
         out[k] = v
 
+    # Vina metrics (for vina_score / vina_dock) so callers (e.g. train quick_eval) get them in out
+    if results and docking_mode in ['vina_score', 'vina_dock']:
+        vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
+        vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
+        out['Vina_score_mean'] = float(np.mean(vina_score_only))
+        out['Vina_score_med'] = float(np.median(vina_score_only))
+        out['Vina_min_mean'] = float(np.mean(vina_min))
+        out['Vina_min_med'] = float(np.median(vina_min))
+    else:
+        out['Vina_score_mean'] = out['Vina_score_med'] = out['Vina_min_mean'] = out['Vina_min_med'] = None
+
     if save:
         validity_dict = {k: out[k] for k in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']}
         torch.save({'stability': validity_dict, 'bond_length': all_bond_dist, 'all_results': results},
