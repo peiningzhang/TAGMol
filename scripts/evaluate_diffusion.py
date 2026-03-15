@@ -84,13 +84,22 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
             n_complete += 1
             try:
                 chem_results = scoring_func.get_chem(mol)
+                data = r.get('data')
+                ligand_filename = getattr(data, 'ligand_filename', None) if data is not None else None
+                protein_filename = getattr(data, 'protein_filename', None) if data is not None else None
                 if docking_mode == 'qvina':
+                    if ligand_filename is None and protein_filename is None:
+                        raise ValueError("data must have ligand_filename or protein_filename for docking")
                     vina_task = QVinaDockingTask.from_generated_mol(
-                        mol, r['data'].ligand_filename, protein_root=protein_root)
+                        mol, ligand_filename=ligand_filename, protein_root=protein_root,
+                        protein_filename=protein_filename)
                     vina_results = vina_task.run_sync()
                 elif docking_mode in ['vina_score', 'vina_dock']:
+                    if ligand_filename is None and protein_filename is None:
+                        raise ValueError("data must have ligand_filename or protein_filename for docking")
                     vina_task = VinaDockingTask.from_generated_mol(
-                        mol, r['data'].ligand_filename, protein_root=protein_root)
+                        mol, ligand_filename=ligand_filename, protein_root=protein_root,
+                        protein_filename=protein_filename)
                     score_only_results = vina_task.run(mode='score_only', exhaustiveness=exhaustiveness)
                     minimize_results = vina_task.run(mode='minimize', exhaustiveness=exhaustiveness)
                     vina_results = {'score_only': score_only_results, 'minimize': minimize_results}
@@ -100,7 +109,9 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                 else:
                     vina_results = None
                 n_eval_success += 1
-            except Exception:
+            except Exception as e:
+                if verbose:
+                    logger.info(f"Docking failed for sample: {e}")
                 continue
             bond_dist = eval_bond_length.bond_distance_from_mol(mol)
             all_bond_dist += bond_dist

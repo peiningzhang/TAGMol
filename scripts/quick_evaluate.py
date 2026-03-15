@@ -222,9 +222,10 @@ def main():
         "--one_line",
     ]
     if args.docking_mode != "none":
+        protein_root = getattr(config.data, "path", args.protein_root) if hasattr(config, "data") else args.protein_root
         eval_cmd += [
             "--protein_root",
-            args.protein_root,
+            protein_root,
             "--exhaustiveness",
             str(args.exhaustiveness),
         ]
