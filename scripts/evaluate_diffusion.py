@@ -24,6 +24,9 @@ def print_dict(d, logger):
 
 
 def print_ring_ratio(all_ring_sizes, logger):
+    if not all_ring_sizes:
+        logger.info('ring size: (no evaluated mols, skip ratio)')
+        return
     for ring_size in range(3, 10):
         n_mol = 0
         for counter in all_ring_sizes:
@@ -60,7 +63,7 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
     _debug_first_sample_logged = [False]
     all_pair_dist, all_bond_dist = [], []
     success_pair_dist, success_atom_types = [], Counter()
-    for example_idx, r_name in enumerate(tqdm(results_fn_list, desc='Eval')):
+    for _, r_name in enumerate(tqdm(results_fn_list, desc='Eval')):
         r = torch.load(r_name)
         all_pred_ligand_pos = r['pred_ligand_pos_traj']
         all_pred_ligand_v = r['pred_ligand_v_traj']
@@ -101,6 +104,7 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                     _debug_first_sample_logged[0] = True
                     protein_path = os.path.join(protein_root, protein_filename) if protein_filename else None
                     logger.info(f"[Docking debug] ligand_filename={ligand_filename!r}, protein_filename={protein_filename!r}, protein_path={protein_path!r}, exists={os.path.exists(protein_path) if protein_path else 'N/A'}")
+                vina_results = None
                 if docking_mode == 'qvina':
                     if ligand_filename is None and protein_filename is None:
                         data_keys = list(data.keys()) if isinstance(data, dict) else [k for k in dir(data) if not k.startswith('_')]
@@ -130,7 +134,6 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                     first_docking_error[0] = (r_name, e)
                 if verbose:
                     logger.info(f"Docking failed for sample: {e}")
-                continue
             bond_dist = eval_bond_length.bond_distance_from_mol(mol)
             all_bond_dist += bond_dist
             success_pair_dist += pair_dist
@@ -188,16 +191,19 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
         out[k] = v
 
     # Vina metrics (for vina_score / vina_dock) so callers (e.g. train quick_eval) get them in out
-    if results and docking_mode in ['vina_score', 'vina_dock']:
-        vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
-        vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
-        out['Vina_score_mean'] = float(np.mean(vina_score_only))
-        out['Vina_score_med'] = float(np.median(vina_score_only))
-        out['Vina_min_mean'] = float(np.mean(vina_min))
-        out['Vina_min_med'] = float(np.median(vina_min))
-    else:
+    try:
+        if results and docking_mode in ['vina_score', 'vina_dock']:
+            vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
+            vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
+            out['Vina_score_mean'] = float(np.mean(vina_score_only))
+            out['Vina_score_med'] = float(np.median(vina_score_only))
+            out['Vina_min_mean'] = float(np.mean(vina_min))
+            out['Vina_min_med'] = float(np.median(vina_min))
+        else:
+            out['Vina_score_mean'] = out['Vina_score_med'] = out['Vina_min_mean'] = out['Vina_min_med'] = None
+    except Exception as e:
+        logger.warning(f"Error calculating Vina metrics: {e}")
         out['Vina_score_mean'] = out['Vina_score_med'] = out['Vina_min_mean'] = out['Vina_min_med'] = None
-
     if save:
         validity_dict = {k: out[k] for k in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']}
         torch.save({'stability': validity_dict, 'bond_length': all_bond_dist, 'all_results': results},
@@ -216,7 +222,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval_step', type=int, default=-1)
     parser.add_argument('--eval_num_examples', type=int, default=None)
     parser.add_argument('--save', type=eval, default=True)
-    parser.add_argument('--protein_root', type=str, default='./data/crossdocked_v1.1_rmsd1.0')
+    parser.add_argument('--protein_root', type=str, default='./data/test_set')
     parser.add_argument('--atom_enc_mode', type=str, default='add_aromatic')
     parser.add_argument('--docking_mode', type=str, choices=['qvina', 'vina_score', 'vina_dock', 'none'])
     parser.add_argument('--exhaustiveness', type=int, default=16)
@@ -276,8 +282,8 @@ if __name__ == '__main__':
             vina_dock = [r['vina']['dock'][0]['affinity'] for r in results]
             logger.info('Vina Dock :  Mean: %.3f Median: %.3f' % (np.mean(vina_dock), np.median(vina_dock)))
 
-    if not args.one_line:
-        print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
+
+    print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
 
     if args.one_line:
         def _fmt(v):

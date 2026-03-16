@@ -160,6 +160,8 @@ def main():
         model.dfm_num_steps = config.model.dfm_num_steps
     if hasattr(config, "model") and hasattr(config.model, "dfm_type"):
         model.config.dfm_type = config.model.dfm_type
+    if hasattr(config, "model") and hasattr(config.model, "veda_x_pred_mode"):
+        model.config.veda_x_pred_mode = config.model.veda_x_pred_mode
     model.load_state_dict(ckpt["model"])
     model.eval()
     logger.info(f"Loaded model from checkpoint: {args.checkpoint}")
@@ -226,10 +228,9 @@ def main():
     ]
     if args.docking_mode != "none":
         eval_cmd += ["--verbose", "True"]
-        protein_root = args.protein_root
         eval_cmd += [
             "--protein_root",
-            protein_root,
+            args.protein_root,
             "--exhaustiveness",
             str(args.exhaustiveness),
         ]

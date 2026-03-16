@@ -12,15 +12,15 @@ model:
   beta_schedule: sigmoid
 
   # EDM coordinate parameters (VEDA)
-  sigma_data: 10
+  sigma_data: 1
   sigma_min: 0.001
-  sigma_max: 800
+  sigma_max: 80
   rho: 2.0
 
   # EDM sigma sampling parameters (training only)
   # sigma ~ LogNormal(P_mean, P_std^2) as per EDM paper
-  edm_p_mean: -0.12   # mean in log-space
-  edm_p_std: 1.70     # std in log-space
+  edm_p_mean: -1.26   # mean in log-space
+  edm_p_std: 1.41     # std in log-space
 
 
   # Discrete FM attribute parameters (VEDA)
@@ -41,8 +41,11 @@ model:
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM
   time_emb_mode: sin  # ['simple', 'sin'] - sin recommended for VEDA
-  time_scheduler: log_uniform  # VEDA sampling: ['log_uniform', 'arcsin', 'edm', 'edm1']
+  time_scheduler: arcsin  # VEDA sampling: ['log_uniform', 'arcsin', 'edm', 'edm1']
   center_pos_mode: protein
+  rescale_factor: 0.2
+
+  veda_x_pred_mode: constant
 
   node_indicator: True
   model_type: uni_o2
@@ -69,7 +72,7 @@ train:
   batch_size: 4
   num_workers: 4
   n_acc_batch: 1
-  max_iters: 200000
+  max_iters: 400000
   val_freq: 2000
   # Quick eval (sampling + full metrics) every N steps, logged to wandb
   quick_eval_freq: 10000

@@ -109,7 +109,7 @@ def to_torch_const(x):
     return x
 
 
-def center_pos(protein_pos, ligand_pos, batch_protein, batch_ligand, mode='protein'):
+def center_pos_rescale(protein_pos, ligand_pos, batch_protein, batch_ligand, mode='protein', rescale_factor=1.0):
     if mode == 'none':
         offset = 0.
         pass
@@ -117,6 +117,8 @@ def center_pos(protein_pos, ligand_pos, batch_protein, batch_ligand, mode='prote
         offset = scatter_mean(protein_pos, batch_protein, dim=0)
         protein_pos = protein_pos - offset[batch_protein]
         ligand_pos = ligand_pos - offset[batch_ligand]
+        protein_pos = protein_pos * rescale_factor
+        ligand_pos = ligand_pos * rescale_factor
     else:
         raise NotImplementedError
     return protein_pos, ligand_pos, offset
@@ -274,6 +276,7 @@ class ScorePosNet3D(nn.Module):
         self.hidden_dim = config.hidden_dim
         self.num_classes = ligand_atom_feature_dim
 
+        self.rescale_factor = config.rescale_factor if hasattr(config, 'rescale_factor') else 1.0
         # Discrete FM prior (VEDA) or DDPM schedule
         discrete_prior = getattr(config, 'discrete_prior', 'uniform')
         if self.diffusion_type == 'veda':
@@ -473,7 +476,15 @@ class ScorePosNet3D(nn.Module):
         final_ligand_pos, final_ligand_h = final_pos[mask_ligand], final_h[mask_ligand]
         ## predict classes of atom-categories at the end of all the layers
         final_ligand_v = self.v_inference(final_ligand_h)
-        final_ligand_pos = c_skip * init_ligand_pos + c_out * final_ligand_pos
+        # final_ligand_pos = c_skip * init_ligand_pos + c_out * final_ligand_pos
+        if self.config.veda_x_pred_mode == 'constant':
+            final_ligand_pos = c_skip * init_ligand_pos + c_out * (final_ligand_pos - pos_ligand_for_net)
+        elif self.config.veda_x_pred_mode == 'adaptive':
+            final_ligand_pos = c_skip * init_ligand_pos + c_out * (final_ligand_pos - c_in *c_out *pos_ligand_for_net)
+        elif self.config.veda_x_pred_mode is None or self.config.veda_x_pred_mode == 'none':
+            final_ligand_pos = c_skip * init_ligand_pos + c_out * final_ligand_pos
+        else:
+            raise NotImplementedError(f"veda_x_pred_mode {self.config.veda_x_pred_mode}")
         preds = {
             'pred_ligand_pos': final_ligand_pos,
             'pred_ligand_v': final_ligand_v,
@@ -609,8 +620,8 @@ class ScorePosNet3D(nn.Module):
             self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, time_step=None
     ):
         num_graphs = batch_protein.max().item() + 1
-        protein_pos, ligand_pos, _ = center_pos(
-            protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode)
+        protein_pos, ligand_pos, _ = center_pos_rescale(
+            protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode, rescale_factor=self.rescale_factor)
 
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + Discrete FM (v) ===
@@ -684,8 +695,8 @@ class ScorePosNet3D(nn.Module):
             self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, time_step):
         if self.diffusion_type == 'veda':
             raise NotImplementedError("Likelihood estimation for VEDA is not yet implemented.")
-        protein_pos, ligand_pos, _ = center_pos(
-            protein_pos, ligand_pos, batch_protein, batch_ligand, mode='protein')
+        protein_pos, ligand_pos, _ = center_pos_rescale(
+            protein_pos, ligand_pos, batch_protein, batch_ligand, mode='protein', rescale_factor=self.rescale_factor)
         assert (time_step == self.num_timesteps).all() or (time_step < self.num_timesteps).all()
         if (time_step == self.num_timesteps).all():
             kl_pos_prior = self.kl_pos_prior(ligand_pos, batch_ligand)
@@ -950,8 +961,8 @@ class ScorePosNet3D(nn.Module):
 
         ## Shifts the origin to the centre of mass of protein
         ## new protein positions, new ligand position and the difference from original position is in the offset
-        protein_pos, init_ligand_pos, offset = center_pos(
-            protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
+        protein_pos, init_ligand_pos, offset = center_pos_rescale(
+            protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
 
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
@@ -1059,14 +1070,14 @@ class ScorePosNet3D(nn.Module):
                             f"pos_norm_mean={ligand_pos.norm(dim=-1).mean().item():.3f}, "
                             f"pos_norm_max={ligand_pos.norm(dim=-1).max().item():.3f}"
                         )
-                ori_ligand_pos0 = pred_ligand_pos + offset[batch_ligand]
-                ori_ligand_pos = ligand_pos + offset[batch_ligand]
+                ori_ligand_pos0 = pred_ligand_pos / self.rescale_factor + offset[batch_ligand]
+                ori_ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
                 pos_traj.append(ori_ligand_pos.clone().cpu())
                 v_traj.append(ligand_v.clone().cpu())
             ligand_pos = pred_ligand_pos
             ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
-            ligand_pos = ligand_pos + offset[batch_ligand]
+            ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
             return {
                 'pos': ligand_pos,
                 'v': ligand_v,
@@ -1097,8 +1108,8 @@ class ScorePosNet3D(nn.Module):
             S = self.num_classes
             eps = 1e-5
 
-            protein_pos, init_ligand_pos, offset = center_pos(
-                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
+            protein_pos, init_ligand_pos, offset = center_pos_rescale(
+                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
 
             pos_traj, v_traj = [], []
             v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
@@ -1167,15 +1178,15 @@ class ScorePosNet3D(nn.Module):
                     v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
                     vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
 
-                ori_ligand_pos0 = D_theta + offset[batch_ligand]
-                ori_ligand_pos = ligand_pos + offset[batch_ligand]
+                ori_ligand_pos0 = D_theta / self.rescale_factor + offset[batch_ligand]
+                ori_ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
                 pos_traj.append(ori_ligand_pos.clone().cpu())
                 v_traj.append(ligand_v.clone().cpu())
 
             ligand_pos = D_theta
             ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
-            ligand_pos = ligand_pos + offset[batch_ligand]
+            ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
             return {
                 'pos': ligand_pos,
                 'v': ligand_v,
@@ -1191,8 +1202,8 @@ class ScorePosNet3D(nn.Module):
                 num_steps = self.num_timesteps
             num_graphs = batch_protein.max().item() + 1
 
-            protein_pos, init_ligand_pos, offset = center_pos(
-                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
+            protein_pos, init_ligand_pos, offset = center_pos_rescale(
+                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
 
             pos_traj, v_traj = [], []
             v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
@@ -1296,13 +1307,13 @@ class ScorePosNet3D(nn.Module):
                     vt_pred_traj.append(log_model_prob.clone().cpu())
                     ligand_v = ligand_v_next
 
-                ori_ligand_pos0 = pos0_from_e + offset[batch_ligand]
-                ori_ligand_pos = ligand_pos + offset[batch_ligand]
+                ori_ligand_pos0 = pos0_from_e / self.rescale_factor + offset[batch_ligand]
+                ori_ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
                 pos_traj.append(ori_ligand_pos.clone().cpu())
                 v_traj.append(ligand_v.clone().cpu())
 
-            ligand_pos = ligand_pos + offset[batch_ligand]
+            ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
             return {
                 'pos': ligand_pos,
                 'v': ligand_v,
@@ -1329,8 +1340,8 @@ class ScorePosNet3D(nn.Module):
             S = self.num_classes
             eps = 1e-5
 
-            protein_pos, init_ligand_pos, offset = center_pos(
-                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
+            protein_pos, init_ligand_pos, offset = center_pos_rescale(
+                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
 
             pos_traj, v_traj = [], []
             v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
@@ -1417,15 +1428,15 @@ class ScorePosNet3D(nn.Module):
                     v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
                     vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
 
-                ori_ligand_pos0 = D_theta + offset[batch_ligand]
-                ori_ligand_pos = ligand_pos + offset[batch_ligand]
+                ori_ligand_pos0 = D_theta / self.rescale_factor + offset[batch_ligand]
+                ori_ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
                 pos_traj.append(ori_ligand_pos.clone().cpu())
                 v_traj.append(ligand_v.clone().cpu())
 
             ligand_pos = D_theta
             ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
-            ligand_pos = ligand_pos + offset[batch_ligand]
+            ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
             return {
                 'pos': ligand_pos,
                 'v': ligand_v,
@@ -1440,8 +1451,8 @@ class ScorePosNet3D(nn.Module):
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
 
-        protein_pos, init_ligand_pos, offset = center_pos(
-            protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
+        protein_pos, init_ligand_pos, offset = center_pos_rescale(
+            protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
 
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
