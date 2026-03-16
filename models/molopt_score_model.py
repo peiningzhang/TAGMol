@@ -677,7 +677,6 @@ class ScorePosNet3D(nn.Module):
             loss_v = scatter_mean(loss_v, batch_ligand, dim=0).mean()
 
             loss = loss_pos + self.loss_v_weight * loss_v
-            # loss_pos, loss_v, loss = loss_pos / 10, loss_v / 10, loss / 10
             return {
                 'loss_pos': loss_pos,
                 'loss_v': loss_v,
@@ -981,10 +980,10 @@ class ScorePosNet3D(nn.Module):
             S = self.num_classes
             n_dfm = self.num_timesteps
             eps = 1e-5
-            noise_injection = False
-            noise_injection_rate = 0
-            noise_injection_high_threshold = 5
-            noise_injection_low_threshold = 0.1
+            noise_injection = True
+            noise_injection_rate = 0.4
+            noise_injection_high_threshold = 3
+            noise_injection_low_threshold = 0
             for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
                 sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)

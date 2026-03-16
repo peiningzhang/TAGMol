@@ -134,6 +134,7 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                     first_docking_error[0] = (r_name, e)
                 if verbose:
                     logger.info(f"Docking failed for sample: {e}")
+                continue
             bond_dist = eval_bond_length.bond_distance_from_mol(mol)
             all_bond_dist += bond_dist
             success_pair_dist += pair_dist
@@ -315,7 +316,7 @@ if __name__ == '__main__':
         elif args.docking_mode in ['vina_dock', 'vina_score'] and results:
             vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
             vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
-            names.extend(['Vina_score_mean', 'Vina_min_mean'])
-            values.extend([_fmt(np.mean(vina_score_only)), _fmt(np.mean(vina_min))])
+            names.extend(['Vina_score_mean', 'Vina_score_med', 'Vina_min_mean', 'Vina_min_med'])
+            values.extend([_fmt(np.mean(vina_score_only)), _fmt(np.median(vina_score_only)), _fmt(np.mean(vina_min)), _fmt(np.median(vina_min))])
         logger.info('METRICS_ONE_LINE_HEAD\t' + '\t'.join(names))
         logger.info('METRICS_ONE_LINE_VAL\t' + '\t'.join(values))

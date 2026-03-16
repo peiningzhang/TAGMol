@@ -176,6 +176,12 @@ class VinaDockingTask(BaseDockingTask):
         """Create task from generated mol. Prefer protein_filename if provided."""
         if protein_filename is not None:
             protein_path = os.path.join(protein_root, protein_filename)
+            if not os.path.exists(protein_path) and ligand_filename is not None:
+                protein_fn = os.path.join(
+                    os.path.dirname(ligand_filename),
+                    os.path.basename(ligand_filename)[:10] + '.pdb'
+                )
+                protein_path = os.path.join(protein_root, protein_fn)
         elif ligand_filename is not None:
             protein_fn = os.path.join(
                 os.path.dirname(ligand_filename),

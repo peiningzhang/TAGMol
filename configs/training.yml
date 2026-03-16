@@ -13,14 +13,14 @@ model:
 
   # EDM coordinate parameters (VEDA)
   sigma_data: 1
-  sigma_min: 0.001
+  sigma_min: 0.0003
   sigma_max: 80
   rho: 2.0
 
   # EDM sigma sampling parameters (training only)
   # sigma ~ LogNormal(P_mean, P_std^2) as per EDM paper
-  edm_p_mean: -1.26   # mean in log-space
-  edm_p_std: 1.41     # std in log-space
+  edm_p_mean: -1.86   # mean in log-space, was -1.26
+  edm_p_std: 1.56     # std in log-space, was 1.41
 
 
   # Discrete FM attribute parameters (VEDA)
@@ -36,12 +36,12 @@ model:
   v_beta_schedule: cosine
   v_beta_s: 0.01
   num_diffusion_timesteps: 100
-  loss_v_weight: 3.
+  loss_v_weight: 0.3
   sample_time_method: symmetric  # ['importance', 'symmetric']
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM
   time_emb_mode: sin  # ['simple', 'sin'] - sin recommended for VEDA
-  time_scheduler: arcsin  # VEDA sampling: ['log_uniform', 'arcsin', 'edm', 'edm1']
+  time_scheduler: log_uniform  # VEDA sampling: ['log_uniform', 'arcsin', 'edm', 'edm1']
   center_pos_mode: protein
   rescale_factor: 0.2
 
@@ -83,7 +83,7 @@ train:
   bond_loss_weight: 1.0
   optimizer:
     type: adam
-    lr: 0.0001 #5.e-4
+    lr: 0.001 #5.e-4
     weight_decay: 0
     beta1: 0.95
     beta2: 0.999
