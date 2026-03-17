@@ -221,6 +221,7 @@ class ScorePosNet3D(nn.Module):
         # variance schedule
         self.model_mean_type = config.model_mean_type  # ['noise', 'C0']
         self.loss_v_weight = config.loss_v_weight
+        self.loss_pos_weight = config.loss_pos_weight if hasattr(config, 'loss_pos_weight') else 1.0
         # self.v_mode = config.v_mode
         # assert self.v_mode == 'categorical'
         # self.v_net_type = getattr(config, 'v_net_type', 'mlp')
@@ -676,7 +677,7 @@ class ScorePosNet3D(nn.Module):
             loss_v = F.cross_entropy(pred_ligand_v, ligand_v, reduction='none')
             loss_v = scatter_mean(loss_v, batch_ligand, dim=0).mean()
 
-            loss = loss_pos + self.loss_v_weight * loss_v
+            loss = self.loss_pos_weight * loss_pos + self.loss_v_weight * loss_v
             return {
                 'loss_pos': loss_pos,
                 'loss_v': loss_v,

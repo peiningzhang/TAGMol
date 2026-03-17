@@ -459,13 +459,13 @@ if __name__ == '__main__':
                         }
                         torch.save(result, os.path.join(tmp_dir, f'result_{data_id}.pt'))
                     quick_eval_docking = getattr(config.train, 'quick_eval_docking_mode', 'vina_score')
-                    protein_root = config.data.path if hasattr(config.data, 'path') else './data/test_set'
+                    test_protein_root = config.data.test_path
                     metrics, _ = run_evaluation(
                         tmp_dir,
                         eval_step=-1,
                         eval_num_examples=n_pocket,
                         docking_mode=quick_eval_docking,
-                        protein_root=protein_root,
+                        protein_root=test_protein_root,
                         atom_enc_mode=config.data.transform.ligand_atom_mode,
                         verbose=False,
                         save=False,

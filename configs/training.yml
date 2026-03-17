@@ -5,6 +5,7 @@ data:
   transform:
     ligand_atom_mode: add_aromatic
     random_rot: False
+  test_path: ./data/test_set
 
 model:
   diffusion_type: veda  # ['veda', 'edm_fm', 'ddpm']
@@ -36,7 +37,8 @@ model:
   v_beta_schedule: cosine
   v_beta_s: 0.01
   num_diffusion_timesteps: 100
-  loss_v_weight: 0.3
+  loss_pos_weight: 3.0
+  loss_v_weight: 1
   sample_time_method: symmetric  # ['importance', 'symmetric']
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM
@@ -83,7 +85,7 @@ train:
   bond_loss_weight: 1.0
   optimizer:
     type: adam
-    lr: 0.001 #5.e-4
+    lr: 0.0001 #5.e-4
     weight_decay: 0
     beta1: 0.95
     beta2: 0.999
