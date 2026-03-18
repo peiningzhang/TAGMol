@@ -356,7 +356,8 @@ class DockGuideNet3D(nn.Module):
             if sigma_per_atom.dim() > 1:
                 sigma_per_atom = sigma_per_atom.squeeze(-1)
             _, _, c_in, c_noise = self.get_edm_scaling(sigma_per_atom)
-            pos_ligand_for_net = c_in.unsqueeze(-1) * ligand_pos if c_in.dim() == 1 else c_in * ligand_pos
+            c_in_scale = c_in.unsqueeze(-1) if c_in.dim() == 1 else c_in
+            pos_ligand_for_net = c_in_scale * ligand_pos * self.sigma_data
         # time embedding
         ## VEDA: c_noise from sigma (consistent with ScorePosNet3D)
         ## DDPM: time_step / num_timesteps or sin(time_step)
