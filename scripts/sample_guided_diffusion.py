@@ -16,10 +16,6 @@ from datasets import get_dataset
 from datasets.pl_data import FOLLOW_BATCH
 from models.molopt_score_model import ScorePosNet3D, log_sample_categorical
 from utils.evaluation import atom_num
-
-from scripts.property_prediction.inference import get_model as get_guide_model
-from utils.transforms_prop import FeaturizeProteinAtom as GuideFeaturizeProteinAtom
-from utils.transforms_prop import FollowerFeaturizeLigandAtom as GuideFeaturizeLigandAtom
 from datasets.protein_ligand import KMAP
 
 '''
@@ -197,7 +193,10 @@ if __name__ == '__main__':
     guide_ckpt = torch.load(config.guide_model.checkpoint, map_location=device)
     logger.info(f"Guide Training Config: {guide_ckpt['config']}")
 
-    # Guide Transforms
+    # Guide Transforms (property_prediction guide; for DockGuideNet3D use train_dock_guide quick_eval)
+    from scripts.property_prediction.inference import get_model as get_guide_model
+    from utils.transforms_prop import FeaturizeProteinAtom as GuideFeaturizeProteinAtom
+    from utils.transforms_prop import FollowerFeaturizeLigandAtom as GuideFeaturizeLigandAtom
     guide_protein_featurizer = GuideFeaturizeProteinAtom()
     guide_ligand_featurizer = GuideFeaturizeLigandAtom(mode=ckpt['config']['data']['transform']['ligand_atom_mode'])
     guide_transform = Compose([
