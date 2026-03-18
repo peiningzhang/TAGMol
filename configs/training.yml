@@ -28,8 +28,6 @@ model:
   discrete_prior: uniform  # ['uniform', 'marginal']
   # DFM (Exact Discrete Flow Matching) parameters
   dfm_beta: 2  # noise injection for predictor-corrector
-  dfm_num_steps: 100  # N for h=1/N
-  dfm_t_max: 100.0  # t in [0, t_max] for kappa(t)=t/(t+1) mapping to [0, 1)
   dfm_type: campbell  # ['gat', 'campbell']
   mask_mode: uniform  # ['uniform', 'edm']
   beta_start: 1.e-7
@@ -38,7 +36,7 @@ model:
   v_beta_s: 0.01
   num_diffusion_timesteps: 100
   loss_pos_weight: 3.0
-  loss_v_weight: 1
+  loss_v_weight: 0.3
   sample_time_method: symmetric  # ['importance', 'symmetric']
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM

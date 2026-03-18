@@ -156,8 +156,8 @@ def main():
         model.config.time_scheduler = config.model.time_scheduler
     if hasattr(config, "model") and hasattr(config.model, "rho"):
         model.rho = config.model.rho
-    if hasattr(config, "model") and hasattr(config.model, "dfm_num_steps"):
-        model.dfm_num_steps = config.model.dfm_num_steps
+    if hasattr(config, "model") and hasattr(config.model, "num_diffusion_timesteps"):
+        model.num_timesteps = config.model.num_diffusion_timesteps
     if hasattr(config, "model") and hasattr(config.model, "dfm_type"):
         model.config.dfm_type = config.model.dfm_type
     if hasattr(config, "model") and hasattr(config.model, "veda_x_pred_mode"):

@@ -379,7 +379,7 @@ class ScorePosNet3D(nn.Module):
             sigma = torch.exp(sigma)
         elif scheduler == 'edm':
             # log_uniform: sigma from sigma_max down to sigma_min
-            r = torch.linspace(1, 0, num_steps + 1, device=device)
+            r = torch.linspace(0, 1, num_steps + 1, device=device)
             sigma = (self.sigma_max ** (1 / self.rho) + r * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho
         elif scheduler == 'arcsin':
         # Use arcsin-based sigma schedule, as described.
@@ -389,6 +389,32 @@ class ScorePosNet3D(nn.Module):
             time_points = np.exp(time_points).tolist()
             time_points.reverse()
             sigma = torch.tensor(time_points, device=device, dtype=torch.float32)
+        elif scheduler == 'edm1':
+            # EDM1: rho = -1 EDM schedule, blended with arcsin schedule, same length/shape as others
+            edm_rho = -1
+            step_indices = torch.linspace(0, 1, num_steps + 1, device=device)
+            edm_sigmas = (self.sigma_max ** (1.0 / edm_rho) + step_indices * (self.sigma_min ** (1.0 / edm_rho) - self.sigma_max ** (1.0 / edm_rho))) ** edm_rho
+
+            arcsin_axis = torch.linspace(0, 1, num_steps + 1, device=device)
+            arcsin_component = 2 * torch.arcsin(arcsin_axis.sqrt()) / np.pi
+            mixed = (1 - self.rho) * arcsin_axis + self.rho * arcsin_component
+            arcsin_sigmas = (mixed * (np.log(self.sigma_max) - np.log(self.sigma_min)) + np.log(self.sigma_min)).exp().flip(dims=[0])
+
+            sigma = 0.5 * edm_sigmas + 0.5 * arcsin_sigmas
+            sigma = torch.tensor(sigma, device=device, dtype=torch.float32)
+        elif scheduler == 'edm1v2':
+            # EDM1: rho = -1 EDM schedule, blended with arcsin schedule, same length/shape as others
+            edm_rho = -1
+            step_indices = torch.linspace(0, 1, num_steps + 1, device=device)
+            edm_sigmas = (self.sigma_max ** (1.0 / edm_rho) + step_indices * (self.sigma_min ** (1.0 / edm_rho) - self.sigma_max ** (1.0 / edm_rho))) ** edm_rho
+
+            arcsin_axis = torch.linspace(0, 1, num_steps + 1, device=device)
+            arcsin_component = 2 * torch.arcsin(arcsin_axis.sqrt()) / np.pi
+            mixed = (1 - self.rho) * arcsin_axis + self.rho * arcsin_component
+            arcsin_sigmas = (mixed * (np.log(self.sigma_max) - np.log(self.sigma_min)) + np.log(self.sigma_min)).exp().flip(dims=[0])
+            rate = (torch.arange(num_steps + 1, dtype=torch.float32)/num_steps).to(device)
+            sigma =  edm_sigmas * rate + arcsin_sigmas * (1 - rate)
+            sigma = torch.tensor(sigma, device=device, dtype=torch.float32)
         else:
             raise NotImplementedError(f"scheduler {scheduler}")
         return sigma
