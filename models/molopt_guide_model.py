@@ -103,6 +103,22 @@ def center_pos(protein_pos, ligand_pos, batch_protein, batch_ligand, mode='prote
     return protein_pos, ligand_pos, offset
 
 
+def center_pos_rescale(protein_pos, ligand_pos, batch_protein, batch_ligand, mode='protein', rescale_factor=1.0):
+    """Center and rescale positions (aligned with ScorePosNet3D)."""
+    if mode == 'none':
+        offset = 0.
+        pass
+    elif mode == 'protein':
+        offset = scatter_mean(protein_pos, batch_protein, dim=0)
+        protein_pos = protein_pos - offset[batch_protein]
+        ligand_pos = ligand_pos - offset[batch_ligand]
+        protein_pos = protein_pos * rescale_factor
+        ligand_pos = ligand_pos * rescale_factor
+    else:
+        raise NotImplementedError
+    return protein_pos, ligand_pos, offset
+
+
 # %% categorical diffusion related
 def index_to_log_onehot(x, num_classes):
     assert x.max().item() < num_classes, f'Error: {x.max().item()} >= {num_classes}'
@@ -263,8 +279,9 @@ class DockGuideNet3D(nn.Module):
         # atom embedding
         self.protein_atom_emb = nn.Linear(protein_atom_feature_dim, emb_dim)
 
-        # center pos
+        # center pos and rescale (aligned with ScorePosNet3D)
         self.center_pos_mode = config.center_pos_mode  # ['none', 'protein']
+        self.rescale_factor = getattr(config, 'rescale_factor', 1.0)
 
         # time embedding
         self.time_emb_dim = config.time_emb_dim
@@ -484,8 +501,8 @@ class DockGuideNet3D(nn.Module):
             self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, dock, time_step=None, return_pred=False
     ):
         num_graphs = batch_protein.max().item() + 1
-        protein_pos, ligand_pos, _ = center_pos(
-            protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode)
+        protein_pos, ligand_pos, _ = center_pos_rescale(
+            protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode, rescale_factor=self.rescale_factor)
 
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + DFM (v) noising ===

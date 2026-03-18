@@ -38,6 +38,7 @@ model:
   time_emb_mode: sin
   time_scheduler: log_uniform
   center_pos_mode: protein
+  rescale_factor: 0.2  # aligned with training.yml (score model)
 
   node_indicator: True
   model_type: egnn
