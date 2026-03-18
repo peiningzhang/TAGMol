@@ -537,55 +537,13 @@ class DockGuideNet3D(nn.Module):
                 sigma=sigma,
                 fix_x=True
             )
-            if self.problem_type == "regression":
-                loss_func = nn.MSELoss()
-                loss = loss_func(preds.view(-1), dock)/100
-            elif self.problem_type == "classification":
-                loss_func = nn.BCEWithLogitsLoss()
-                loss = loss_func(preds.view(-1), dock.float())
-            else:
-                raise ValueError(f"Unknown problem type: {self.problem_type}")
+            loss_func = nn.MSELoss()
+            loss = loss_func(preds.view(-1), dock)
             if return_pred:
                 return loss, preds
             return loss
-
-        # === DDPM (legacy) ===
-        if time_step is None:
-            time_step, pt = self.sample_time(num_graphs, protein_pos.device, self.sample_time_method)
         else:
-            pt = torch.ones_like(time_step).float() / self.num_timesteps
-        a = self.alphas_cumprod.index_select(0, time_step)
-
-        a_pos = a[batch_ligand].unsqueeze(-1)
-        pos_noise = torch.zeros_like(ligand_pos)
-        pos_noise.normal_()
-        ligand_pos_perturbed = a_pos.sqrt() * ligand_pos + (1.0 - a_pos).sqrt() * pos_noise
-        log_ligand_v0 = index_to_log_onehot(ligand_v, self.num_classes)
-        ligand_v_perturbed, log_ligand_vt = self.q_v_sample(log_ligand_v0, time_step, batch_ligand)
-
-        preds = self(
-            protein_pos=protein_pos,
-            protein_atom_feature=protein_v,
-            batch_protein=batch_protein,
-            ligand_pos=ligand_pos_perturbed,
-            ligand_atom_feature=F.one_hot(ligand_v_perturbed, self.num_classes),
-            batch_ligand=batch_ligand,
-            time_step=time_step,
-            fix_x=True
-        )
-
-        if self.problem_type == "regression":
-            loss_func = nn.MSELoss()
-            loss = loss_func(preds.view(-1), dock)
-        elif self.problem_type == "classification":
-            loss_func = nn.BCEWithLogitsLoss()
-            loss = loss_func(preds.view(-1), dock.float())
-        else:
-            raise ValueError(f"Unknown problem type: {self.problem_type}")
-        if return_pred:
-            return loss, preds
-        return loss
-
+            raise NotImplementedError(f"Not implemented for {self.diffusion_type} diffusion type")
     def get_gradients_guide(self, protein_pos, protein_atom_feature, ligand_pos, ligand_atom_feature, batch_protein, batch_ligand, time_step=None, sigma=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
         """Get gradients for classifier guidance. Use sigma (VEDA) or time_step (DDPM). Exactly one must be provided."""
         assert (sigma is not None) != (time_step is not None), "Provide either sigma (VEDA) or time_step (DDPM), not both or neither."
@@ -606,11 +564,9 @@ class DockGuideNet3D(nn.Module):
                 sigma=sigma,
                 fix_x=True
             )
-            if self.problem_type not in ("classification", ):
-                if clamp_pred_min is not None or clamp_pred_max is not None:
-                    pred = torch.clamp(pred, min=clamp_pred_min, max=clamp_pred_max)
-            else:
-                raise NotImplementedError(f"Not implemented for {self.problem_type} problem type")
+
+            if clamp_pred_min is not None or clamp_pred_max is not None:
+                pred = torch.clamp(pred, min=clamp_pred_min, max=clamp_pred_max)
             if self.maximize_property:
                 # maximize pred => minimize -pred`
                 pred = -pred
