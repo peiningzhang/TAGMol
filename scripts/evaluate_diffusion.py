@@ -318,5 +318,5 @@ if __name__ == '__main__':
             vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
             names.extend(['Vina_score_mean', 'Vina_score_med', 'Vina_min_mean', 'Vina_min_med'])
             values.extend([_fmt(np.mean(vina_score_only)), _fmt(np.median(vina_score_only)), _fmt(np.mean(vina_min)), _fmt(np.median(vina_min))])
-        logger.info('METRICS_ONE_LINE_HEAD\t' + '\t'.join(names))
-        logger.info('METRICS_ONE_LINE_VAL\t' + '\t'.join(values))
+        logger.info('METRICS_ONE_LINE_HEAD\t' + '\t '.join(names))
+        logger.info('METRICS_ONE_LINE_VAL\t' + '\t '.join(values))

@@ -69,7 +69,7 @@ train:
   max_iters: 200000
   val_freq: 2000
   pos_noise_std: 0.1
-  max_grad_norm: 1.0  # lower for guide stability (vs 8.0 in training.yml)
+  max_grad_norm: 8.0  # lower for guide stability (vs 8.0 in training.yml)
   bond_loss_weight: 1.0
   # Target normalization for docking score stability
   normalize_target: true
@@ -84,7 +84,7 @@ train:
   score_model_checkpoint: logs_diffusion/training_2026_03_17__11_23_43/checkpoints/last.pt
   optimizer:
     type: adam
-    lr: 0.0005  # lower for guide stability (vs 0.0001 in training.yml)
+    lr: 0.0001  # lower for guide stability (vs 0.0001 in training.yml)
     weight_decay: 0
     beta1: 0.95
     beta2: 0.999

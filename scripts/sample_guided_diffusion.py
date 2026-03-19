@@ -76,6 +76,11 @@ def sample_guided_diffusion_ligand(model, guide_model, data, num_samples, kind=2
                 uniform_logits = torch.zeros(len(batch_ligand), model.num_classes).to(device)
                 init_ligand_v = log_sample_categorical(uniform_logits)
 
+            if isinstance(kind, int):
+                kind_val = kind
+            else:
+                kind_val = KMAP[kind]
+
             r = model.sample_guided_diffusion(
                 guide_model=guide_model,
                 gradient_scale_cord=gradient_scale_cord,
@@ -83,7 +88,7 @@ def sample_guided_diffusion_ligand(model, guide_model, data, num_samples, kind=2
                 clamp_pred_min=clamp_pred_min,
                 clamp_pred_max=clamp_pred_max,
 
-                kind=torch.tensor([KMAP[kind]]*n_data).to(device),
+                kind=torch.tensor([kind_val]*n_data).to(device),
                 protein_pos=batch.protein_pos,
                 protein_v=batch.protein_atom_feature.float(),
                 batch_protein=batch_protein,

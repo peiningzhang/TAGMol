@@ -1005,7 +1005,6 @@ class ScorePosNet3D(nn.Module):
             # Training: t=0 (clean, kappa=0) -> t=t_max (noise, kappa->1)
             # Sampling: Reverse direction, from noise (t=t_max) to clean (t=0)
             S = self.num_classes
-            n_dfm = self.num_timesteps
             eps = 1e-5
             noise_injection = True
             noise_injection_rate = 0.4
@@ -1124,8 +1123,7 @@ class ScorePosNet3D(nn.Module):
                          num_steps=None, center_pos_mode=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + DFM (v) with classifier guidance via sigma ===
-            if num_steps is None:
-                num_steps = self.num_timesteps
+            num_steps = self.num_timesteps
             num_graphs = batch_protein.max().item() + 1
             device = protein_pos.device
             n_dfm = num_steps
@@ -1133,7 +1131,10 @@ class ScorePosNet3D(nn.Module):
             sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
             S = self.num_classes
             eps = 1e-5
-
+            noise_injection = True
+            noise_injection_rate = 0.4
+            noise_injection_high_threshold = 3
+            noise_injection_low_threshold = 0
             protein_pos, init_ligand_pos, offset = center_pos_rescale(
                 protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
 
@@ -1146,7 +1147,38 @@ class ScorePosNet3D(nn.Module):
             for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
                 sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)
-
+                if (sigma_i < noise_injection_high_threshold).all() and (sigma_i > noise_injection_low_threshold).all() and noise_injection:
+                    # 保存原始sigma_i用于计算噪声
+                    sigma_i_original = sigma_i.clone()
+                    # 增大sigma_i，使其更noisy
+                    sigma_i = (1 + noise_injection_rate) * sigma_i
+                    
+                    # 计算位置噪声：根据增大后的sigma_i添加合理的高斯噪声
+                    # 噪声尺度应该与sigma_i成正比，确保与扩散过程一致
+                    sigma_per_atom_original = sigma_i_original[batch_ligand]
+                    sigma_per_atom_new = sigma_i[batch_ligand]
+                    # 添加与sigma变化一致的噪声
+                    noise_scale = torch.sqrt((sigma_per_atom_new**2 - sigma_per_atom_original**2).clamp(min=0))
+                    # _, noise_injection_pos, _ = center_pos(
+                        # protein_pos, torch.randn_like(ligand_pos), batch_protein, batch_ligand, mode=center_pos_mode)
+                    noise_injection_pos = torch.randn_like(ligand_pos)
+                    noise_injection_pos -= scatter_mean(noise_injection_pos, batch_ligand, dim=0)[batch_ligand]
+                    ligand_pos = ligand_pos + noise_injection_pos * noise_scale
+                    
+                    # 更新离散特征：根据mask_rate的变化来mask更多原子
+                    mask_rate_original = self.dfm_scheduler.mask_rate(sigma_i_original)[batch_ligand]
+                    mask_rate_new = self.dfm_scheduler.mask_rate(sigma_i)[batch_ligand]
+                    mask_rate_diff = ((mask_rate_new - mask_rate_original)/(1-mask_rate_original).clamp(min=1e-5)).clamp(min=0).squeeze(-1)  # (N_atoms,)
+                    # 对每个原子，根据mask_rate_diff的概率进行mask
+                    mask_probs = torch.rand(ligand_v.shape[0], device=ligand_v.device)
+                    mask_mask = mask_probs < mask_rate_diff
+                    if mask_mask.any():
+                        # 为每个被mask的原子采样新的类别
+                        num_masked = mask_mask.sum().item()
+                        ligand_v[mask_mask] = torch.distributions.Categorical(probs=self.prior_dist).sample((num_masked,)).to(ligand_v.device)
+                
+                sigma_per_atom = sigma_i[batch_ligand]
+                sigma_next_per_atom = sigma_next[batch_ligand]
                 with torch.no_grad():
                     preds = self(
                         protein_pos=protein_pos,
@@ -1155,17 +1187,12 @@ class ScorePosNet3D(nn.Module):
                         init_ligand_pos=ligand_pos,
                         init_ligand_v=ligand_v,
                         batch_ligand=batch_ligand,
-                        sigma=sigma_i
+                        sigma=sigma_per_atom
                     )
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
-                sigma_per_atom = sigma_i[batch_ligand]
-                sigma_next_per_atom = sigma_next[batch_ligand]
-                c_skip, c_out, _, _ = self.get_edm_scaling(sigma_per_atom)
-                D_theta = c_skip * ligand_pos + c_out * pred_ligand_pos
-
                 step_size = sigma_next_per_atom - sigma_per_atom
-                d_i = (ligand_pos - D_theta) / sigma_per_atom.clamp(min=1e-12)
+                d_i = (ligand_pos - pred_ligand_pos) / sigma_per_atom.clamp(min=1e-12)
 
                 # Classifier guidance: pass sigma to guide (VEDA mode)
                 grad_result = guide_model.get_gradients_guide(
@@ -1175,7 +1202,7 @@ class ScorePosNet3D(nn.Module):
                     ligand_atom_feature=F.one_hot(ligand_v, self.num_classes).float(),
                     batch_protein=batch_protein,
                     batch_ligand=batch_ligand,
-                    sigma=sigma_i,
+                    sigma=sigma_per_atom,
                     pos_only=pos_only,
                     clamp_pred_min=clamp_pred_min,
                     clamp_pred_max=clamp_pred_max,
@@ -1184,33 +1211,37 @@ class ScorePosNet3D(nn.Module):
                 ligand_v_grad = None if pos_only else grad_result[1]
 
                 # Euler step with gradient guidance (scale by sigma, analogous to DDPM's pos_log_variance)
-                ligand_pos_grad_update = gradient_scale_cord * ligand_pos_grad * sigma_per_atom
-                ligand_pos = ligand_pos + step_size * d_i - ligand_pos_grad_update
-
+                d_i_guided = d_i - gradient_scale_cord * ligand_pos_grad * sigma_per_atom
+                ligand_pos = ligand_pos + step_size * d_i_guided
+                print("d_i.abs().mean().item()", d_i.abs().mean().item())
+                print("shift_guided.abs().mean().item()", (gradient_scale_cord * ligand_pos_grad * sigma_per_atom).abs().mean().item())
                 if not pos_only:
+                    if gradient_scale_categ != 0 and ligand_v_grad is not None:
+                        # 指南：在预测的 x_0 logits (对数概率空间) 加上 Guidance 梯度
+                        # 确保梯度方向能够激发目标类别的对数概率
+                        guided_pred_ligand_v = pred_ligand_v + gradient_scale_categ * ligand_v_grad
+                        print("shift_guided_v.abs().mean().item()", (gradient_scale_categ * ligand_v_grad).abs().mean().item())
+                        print("pred_ligand_v.abs().mean().item()", pred_ligand_v.abs().mean().item())
+                    else:
+                        guided_pred_ligand_v = pred_ligand_v
                     ligand_v, p_step, p_1_given_t = discrete_update(
                         ligand_v=ligand_v,
-                        pred_ligand_v=pred_ligand_v,
-                        sigma_i=sigma_i,
-                        sigma_next=sigma_next,
+                        pred_ligand_v=guided_pred_ligand_v,
+                        sigma_i=sigma_per_atom,
+                        sigma_next=sigma_next_per_atom,
                         batch_ligand=batch_ligand,
                         eps=eps,
                     )
-                    if gradient_scale_categ != 0 and ligand_v_grad is not None:
-                        updated_prob = F.softmax(pred_ligand_v, dim=-1) - gradient_scale_categ * ligand_v_grad
-                        updated_prob = updated_prob.clamp(min=1e-9)
-                        updated_prob = updated_prob / updated_prob.sum(dim=-1, keepdim=True)
-                        ligand_v = torch.distributions.Categorical(probs=updated_prob).sample()
                     v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
                     vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
 
-                ori_ligand_pos0 = D_theta / self.rescale_factor + offset[batch_ligand]
+                ori_ligand_pos0 = pred_ligand_pos / self.rescale_factor + offset[batch_ligand]
                 ori_ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
                 pos_traj.append(ori_ligand_pos.clone().cpu())
                 v_traj.append(ligand_v.clone().cpu())
 
-            ligand_pos = D_theta
+            ligand_pos = pred_ligand_pos
             ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
             ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
             return {
@@ -1222,134 +1253,8 @@ class ScorePosNet3D(nn.Module):
                 'v0_traj': v0_pred_traj,
                 'vt_traj': vt_pred_traj
             }
-
         elif self.diffusion_type == 'ddpm':
-            if num_steps is None:
-                num_steps = self.num_timesteps
-            num_graphs = batch_protein.max().item() + 1
-
-            protein_pos, init_ligand_pos, offset = center_pos_rescale(
-                protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
-
-            pos_traj, v_traj = [], []
-            v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
-            ligand_pos, ligand_v = init_ligand_pos, init_ligand_v
-            # time sequence
-            time_seq = list(reversed(range(self.num_timesteps - num_steps, self.num_timesteps)))
-            for i in tqdm(time_seq, desc='sampling', total=len(time_seq)):
-                t = torch.full(size=(num_graphs,), fill_value=i, dtype=torch.long, device=protein_pos.device)
-                with torch.no_grad():
-                    preds = self(
-                        protein_pos=protein_pos,
-                        protein_v=protein_v,
-                        batch_protein=batch_protein,
-
-                        init_ligand_pos=ligand_pos,
-                        init_ligand_v=ligand_v,
-                        batch_ligand=batch_ligand,
-                        time_step=t
-                    )
-                # Compute posterior mean and variance
-                if self.model_mean_type == 'noise':
-                    pred_pos_noise = preds['pred_ligand_pos'] - ligand_pos
-                    pos0_from_e = self._predict_x0_from_eps(xt=ligand_pos, eps=pred_pos_noise, t=t, batch=batch_ligand)
-                    v0_from_e = preds['pred_ligand_v']
-                    raise NotImplementedError
-                elif self.model_mean_type == 'C0':
-                    pos0_from_e = preds['pred_ligand_pos']
-                    v0_from_e = preds['pred_ligand_v']
-
-                else:
-                    raise ValueError
-                
-                pos_model_mean = self.q_pos_posterior(x0=pos0_from_e, xt=ligand_pos, t=t, batch=batch_ligand)
-                pos_log_variance = extract(self.posterior_logvar, t, batch_ligand)
-                ## Classifier Guidance for the Diffusion 
-                # ligand_v_grad = None 
-                # ligand_pos_grad = guide_model.get_gradients_guide(
-                #     protein_pos=protein_pos,
-                #     protein_atom_feature=protein_v,
-                #     ligand_pos=ligand_pos,
-                #     ligand_atom_feature=F.one_hot(ligand_v,self.num_classes).float(),
-                #     batch_protein=batch_protein,
-                #     batch_ligand=batch_ligand,
-                #     output_kind=kind,
-                #     pos_only=True
-                # )
-                
-                ligand_v_grad = None
-                ligand_pos_grad, ligand_v_grad = guide_model.get_gradients_guide(
-                    protein_pos=protein_pos,
-                    protein_atom_feature=protein_v,
-                    ligand_pos=ligand_pos,
-                    ligand_atom_feature=F.one_hot(ligand_v,self.num_classes).float(),
-                    batch_protein=batch_protein,
-                    batch_ligand=batch_ligand,
-                    # output_kind=kind,
-                    time_step=t,
-                    pos_only=False,
-                    clamp_pred_min=clamp_pred_min,
-                    clamp_pred_max=clamp_pred_max,
-                )
-                ## update the coordinates based on the computed gradient after scaling
-                # pos_model_mean = pos_model_mean - gradient_scale_cord*ligand_pos_grad
-                
-                ligand_pos_grad_update = gradient_scale_cord*ligand_pos_grad * ((0.5 * pos_log_variance).exp())
-                pos_model_mean = pos_model_mean - ligand_pos_grad_update
-                
-                # no noise when t == 0
-                nonzero_mask = (1 - (t == 0).float())[batch_ligand].unsqueeze(-1)
-                ligand_pos_next = pos_model_mean + nonzero_mask * (0.5 * pos_log_variance).exp() * torch.randn_like(
-                    ligand_pos)
-                ligand_pos = ligand_pos_next
-
-                if not pos_only:
-                    ## v0^ predicted from current time step
-                    log_ligand_v_recon = F.log_softmax(v0_from_e, dim=-1)
-                    ## vt
-                    log_ligand_v = index_to_log_onehot(ligand_v, self.num_classes)                
-                    ## posterior probability of vt-1 given v0^ and vt
-                    log_model_prob = self.q_v_posterior(log_ligand_v_recon, log_ligand_v, t, batch_ligand)
-                    
-                    ## Classifer update
-                    ## update the categories based on gradient guidance
-                    if gradient_scale_categ != 0:
-                        ## heuristic-driven. no significant mathematical justification 
-                        # prob [0.8, 0.2]
-                        # guidance [-0.9, -0.7]
-                        # [-0.1, -0.5]
-                        # [0.4, 0.0]
-                        # [1, 0]
-                        updated_model_prob = torch.exp(log_model_prob) - (gradient_scale_categ)*ligand_v_grad
-                        updated_model_prob = updated_model_prob - torch.min(updated_model_prob,axis=-1).values.unsqueeze(1)
-                        updated_model_prob = (updated_model_prob.T / updated_model_prob.sum(axis=1)).T
-                        log_model_prob = torch.log(updated_model_prob)
-                    ## end of classifier guidance
-                    
-                    ## sample vt-1 from the probabilities
-                    ligand_v_next = log_sample_categorical(log_model_prob)
-                    # import pdb;pdb.set_trace()
-                    v0_pred_traj.append(log_ligand_v_recon.clone().cpu())
-                    vt_pred_traj.append(log_model_prob.clone().cpu())
-                    ligand_v = ligand_v_next
-
-                ori_ligand_pos0 = pos0_from_e / self.rescale_factor + offset[batch_ligand]
-                ori_ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
-                pos0_traj.append(ori_ligand_pos0.clone().cpu())
-                pos_traj.append(ori_ligand_pos.clone().cpu())
-                v_traj.append(ligand_v.clone().cpu())
-
-            ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
-            return {
-                'pos': ligand_pos,
-                'v': ligand_v,
-                'pos_traj': pos_traj,
-                'pos0_traj': pos0_traj,
-                'v_traj': v_traj,
-                'v0_traj': v0_pred_traj,
-                'vt_traj': vt_pred_traj
-            }
-
+            raise NotImplementedError
 
     def sample_multi_guided_diffusion(self, guide_models, guide_configs, n_data, device, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,

@@ -406,7 +406,8 @@ if __name__ == '__main__':
                     log_parts = ['%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None]
                     logger.info('[QuickEval] Iter %d | %s' % (it, ' '.join(log_parts)))
                 except Exception as e:
-                    logger.warning('[QuickEval] Error: %s' % e)
+                    import traceback
+                    logger.warning('[QuickEval] Error: %s\n%s' % (e, traceback.format_exc()))
                 finally:
                     model.train()
                     if os.path.isdir(tmp_dir):
@@ -419,8 +420,6 @@ if __name__ == '__main__':
                     best_loss, best_iter = val_loss, it
                     if ckpt_dir is not None:
                         ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
-                        for old_ckpt in glob.glob(os.path.join(ckpt_dir, "*.pt")):
-                            os.remove(old_ckpt)
                         torch.save({
                             'config': config,
                             'model': model.state_dict(),

@@ -31,9 +31,8 @@ import utils.misc as misc
 import utils.transforms as trans
 from datasets import get_dataset
 from models.molopt_score_model import ScorePosNet3D
-from models.molopt_guide_model import DockGuideNet3D
 from scripts.sample_diffusion import sample_diffusion_ligand
-from scripts.sample_guided_diffusion import sample_guided_diffusion_ligand
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -104,25 +103,6 @@ def main():
         default=16,
         help="Docking exhaustiveness passed to evaluate_diffusion.py.",
     )
-    # Guided diffusion params
-    parser.add_argument(
-        "--guide_checkpoint",
-        type=str,
-        default=None,
-        help="Path to trained property guidance model checkpoint.",
-    )
-    parser.add_argument(
-        "--guide_scale_cord", type=float, default=1.0, help="Scale for coordinate guidance."
-    )
-    parser.add_argument(
-        "--guide_scale_categ", type=float, default=0.01, help="Scale for categorical guidance."
-    )
-    parser.add_argument(
-        "--guide_kind", type=int, default=2, help="Prior kind to guide to (default=2 i.e., Kd)"
-    )
-    parser.add_argument(
-        "--time_scheduler", type=str, default=None, help="Time scheduler to use, overriding config"
-    )
     args = parser.parse_args()
 
     # Load config (for data + basic settings)
@@ -172,9 +152,7 @@ def main():
         ligand_atom_feature_dim=ligand_featurizer.feature_dim,
     ).to(args.device)
     # 在 main 里，model = ScorePosNet3D(...) 之后加：
-    if getattr(args, "time_scheduler", None) is not None:
-        model.config.time_scheduler = args.time_scheduler
-    elif hasattr(config, "model") and hasattr(config.model, "time_scheduler"):
+    if hasattr(config, "model") and hasattr(config.model, "time_scheduler"):
         model.config.time_scheduler = config.model.time_scheduler
     if hasattr(config, "model") and hasattr(config.model, "rho"):
         model.rho = config.model.rho
@@ -188,72 +166,31 @@ def main():
     model.eval()
     logger.info(f"Loaded model from checkpoint: {args.checkpoint}")
 
-    # Optionally load guide model
-    guide_model = None
-    if args.guide_checkpoint is not None:
-        logger.info(f"Loading guide model from {args.guide_checkpoint}...")
-        guide_ckpt = torch.load(args.guide_checkpoint, map_location=args.device)
-        guide_model = DockGuideNet3D(
-            guide_ckpt['config'].model,
-            protein_atom_feature_dim=protein_featurizer.feature_dim,
-            ligand_atom_feature_dim=ligand_featurizer.feature_dim
-        ).to(args.device)
-        guide_model.load_state_dict(guide_ckpt['model'])
-        guide_model.eval()
-
     # Sampling loop
     for data_id in range(num_proteins):
         data = test_set[data_id]
         logger.info(f"Sampling for protein index {data_id}...")
 
-        if guide_model is not None:
-            (
-                pred_pos,
-                pred_v,
-                pred_pos_traj,
-                pred_v_traj,
-                pred_v0_traj,
-                pred_vt_traj,
-                pred_pos0_traj,
-                time_list,
-            ) = sample_guided_diffusion_ligand(
-                model=model,
-                guide_model=guide_model,
-                data=data,
-                num_samples=args.num_ligands_per_protein,
-                kind=args.guide_kind,
-                gradient_scale_cord=args.guide_scale_cord,
-                gradient_scale_categ=args.guide_scale_categ,
-                clamp_pred_min=None,
-                clamp_pred_max=None,
-                batch_size=args.batch_size,
-                device=args.device,
-                num_steps=ckpt_config.model.num_diffusion_timesteps,
-                pos_only=False,
-                center_pos_mode=ckpt_config.model.center_pos_mode,
-                sample_num_atoms="prior",
-            )
-        else:
-            (
-                pred_pos,
-                pred_v,
-                pred_pos_traj,
-                pred_v_traj,
-                pred_v0_traj,
-                pred_vt_traj,
-                pred_pos0_traj,
-                time_list,
-            ) = sample_diffusion_ligand(
-                model,
-                data,
-                args.num_ligands_per_protein,
-                batch_size=args.batch_size,
-                device=args.device,
-                num_steps=ckpt_config.model.num_diffusion_timesteps,
-                pos_only=False,
-                center_pos_mode=ckpt_config.model.center_pos_mode,
-                sample_num_atoms="prior",
-            )
+        (
+            pred_pos,
+            pred_v,
+            pred_pos_traj,
+            pred_v_traj,
+            pred_v0_traj,
+            pred_vt_traj,
+            pred_pos0_traj,
+            time_list,
+        ) = sample_diffusion_ligand(
+            model,
+            data,
+            args.num_ligands_per_protein,
+            batch_size=args.batch_size,
+            device=args.device,
+            num_steps=ckpt_config.model.num_diffusion_timesteps,
+            pos_only=False,
+            center_pos_mode=ckpt_config.model.center_pos_mode,
+            sample_num_atoms="prior",
+        )
 
         result = {
             "data": data,
