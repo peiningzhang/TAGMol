@@ -1211,10 +1211,10 @@ class ScorePosNet3D(nn.Module):
                 ligand_v_grad = None if pos_only else grad_result[1]
 
                 # Euler step with gradient guidance (scale by sigma, analogous to DDPM's pos_log_variance)
-                d_i_guided = d_i - gradient_scale_cord * ligand_pos_grad * sigma_per_atom
+                d_i_guided = d_i + gradient_scale_cord * ligand_pos_grad * sigma_per_atom
                 ligand_pos = ligand_pos + step_size * d_i_guided
                 print("d_i.abs().mean().item()", d_i.abs().mean().item())
-                print("shift_guided.abs().mean().item()", (gradient_scale_cord * ligand_pos_grad * sigma_per_atom).abs().mean().item())
+                print("shift_guided.abs().mean().item()", (gradient_scale_cord * ligand_pos_grad).abs().mean().item())
                 if not pos_only:
                     if gradient_scale_categ != 0 and ligand_v_grad is not None:
                         # 指南：在预测的 x_0 logits (对数概率空间) 加上 Guidance 梯度

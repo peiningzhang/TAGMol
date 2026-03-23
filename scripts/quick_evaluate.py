@@ -123,6 +123,9 @@ def main():
     parser.add_argument(
         "--time_scheduler", type=str, default=None, help="Time scheduler to use, overriding config"
     )
+    parser.add_argument(
+        "--num_steps", type=int, default=None, help="Number of diffusion steps for sampling, overriding config"
+    )
     args = parser.parse_args()
 
     # Load config (for data + basic settings)
@@ -178,7 +181,9 @@ def main():
         model.config.time_scheduler = config.model.time_scheduler
     if hasattr(config, "model") and hasattr(config.model, "rho"):
         model.rho = config.model.rho
-    if hasattr(config, "model") and hasattr(config.model, "num_diffusion_timesteps"):
+    if getattr(args, "num_steps", None) is not None:
+        model.num_timesteps = args.num_steps
+    elif hasattr(config, "model") and hasattr(config.model, "num_diffusion_timesteps"):
         model.num_timesteps = config.model.num_diffusion_timesteps
     if hasattr(config, "model") and hasattr(config.model, "dfm_type"):
         model.config.dfm_type = config.model.dfm_type
@@ -228,7 +233,7 @@ def main():
                 clamp_pred_max=None,
                 batch_size=args.batch_size,
                 device=args.device,
-                num_steps=ckpt_config.model.num_diffusion_timesteps,
+                num_steps=model.num_timesteps,
                 pos_only=False,
                 center_pos_mode=ckpt_config.model.center_pos_mode,
                 sample_num_atoms="prior",
@@ -249,7 +254,7 @@ def main():
                 args.num_ligands_per_protein,
                 batch_size=args.batch_size,
                 device=args.device,
-                num_steps=ckpt_config.model.num_diffusion_timesteps,
+                num_steps=model.num_timesteps,
                 pos_only=False,
                 center_pos_mode=ckpt_config.model.center_pos_mode,
                 sample_num_atoms="prior",

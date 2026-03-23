@@ -376,6 +376,8 @@ if __name__ == '__main__':
                                 pos_only=False,
                                 center_pos_mode=config.model.center_pos_mode,
                                 sample_num_atoms='prior',
+                                gradient_scale_cord=config.get("sample", {}).get("gradient_scale_cord", 1.0),
+                                gradient_scale_categ=config.get("sample", {}).get("gradient_scale_categ", -10.0),
                             )
                         result = {
                             'data': data,

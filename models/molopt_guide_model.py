@@ -538,7 +538,7 @@ class DockGuideNet3D(nn.Module):
                 fix_x=True
             )
             loss_func = nn.MSELoss()
-            loss = loss_func(preds.view(-1), dock)/100
+            loss = loss_func(preds.view(-1), dock)
             if return_pred:
                 return loss, preds
             return loss
