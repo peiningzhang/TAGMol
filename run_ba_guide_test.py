@@ -3,10 +3,10 @@ import subprocess
 import os
 import csv
 
-cords = [0.0, 0.1]
+cords = [1.0, 10.0]
 categs = [-100.0, -200.0]
 
-output_csv = "BA_guide_test_w1.csv"
+output_csv = "BA_guide_test_w001.csv"
 
 combinations = list(itertools.product(cords, categs))
 print(f"Total combinations to evaluate: {len(combinations)}")
@@ -31,7 +31,7 @@ with open(output_csv, mode='a', newline='') as f:
             "--num_proteins", "10",
             "--num_ligands_per_protein", "10",
             "--docking_mode", "vina_score",
-            "--guide_checkpoint", "logs/training_dock_guide_veda_2026_03_20__10_30_47/checkpoints/last.pt",
+            "--guide_checkpoint", "logs/training_dock_guide_veda_2026_03_18__16_14_08/checkpoints/last.pt",
             "--guide_scale_cord", str(cord),
             "--guide_scale_categ", str(categ),
             "--num_steps", "100"
