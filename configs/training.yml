@@ -37,6 +37,9 @@ model:
   num_diffusion_timesteps: 100
   loss_pos_weight: 3.0
   loss_v_weight: 0.3
+  bond_loss: true
+  loss_bond_weight: 0.1
+  loss_non_bond_weight: 0.02   # suppress no-bond class dominance
   sample_time_method: symmetric  # ['importance', 'symmetric']
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM
@@ -80,7 +83,6 @@ train:
   quick_eval_num_ligands_per_protein: 10
   pos_noise_std: 0.1
   max_grad_norm: 8.0
-  bond_loss_weight: 1.0
   optimizer:
     type: adam
     lr: 0.0001 #5.e-4

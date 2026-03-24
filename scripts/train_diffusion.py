@@ -284,9 +284,13 @@ if __name__ == '__main__':
 
                 ligand_pos=batch.ligand_pos,
                 ligand_v=batch.ligand_atom_feature_full,
-                batch_ligand=batch.ligand_element_batch
+                batch_ligand=batch.ligand_element_batch,
+                ligand_bond_index=batch.ligand_bond_index,
+                ligand_bond_type=batch.ligand_bond_type,
+                ligand_bond_type_batch=batch.ligand_bond_type_batch,
             )
             loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
+            loss_bond = results.get('loss_bond', torch.tensor(0.))
             loss = loss / config.train.n_acc_batch
             loss.backward()
         orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
@@ -294,8 +298,8 @@ if __name__ == '__main__':
 
         if it % args.train_report_iter == 0:
             logger.info(
-                '[Train] Iter %d | Loss %.6f (pos %.6f | v %.6f) | Lr: %.6f | Grad Norm: %.6f' % (
-                    it, loss, loss_pos, loss_v, optimizer.param_groups[0]['lr'], orig_grad_norm
+                '[Train] Iter %d | Loss %.6f (pos %.6f | v %.6f | bond %.6f) | Lr: %.6f | Grad Norm: %.6f' % (
+                    it, loss, loss_pos, loss_v, loss_bond, optimizer.param_groups[0]['lr'], orig_grad_norm
                 )
             )
 
@@ -350,13 +354,18 @@ if __name__ == '__main__':
                         ligand_pos=batch.ligand_pos,
                         ligand_v=batch.ligand_atom_feature_full,
                         batch_ligand=batch.ligand_element_batch,
-                        time_step=time_step
+                        time_step=time_step,
+                        ligand_bond_index=batch.ligand_bond_index,
+                        ligand_bond_type=batch.ligand_bond_type,
+                        ligand_bond_type_batch=batch.ligand_bond_type_batch,
                     )
                     loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
+                    loss_bond = results.get('loss_bond', torch.tensor(0.))
 
                     sum_loss += float(loss) * batch_size
                     sum_loss_pos += float(loss_pos) * batch_size
                     sum_loss_v += float(loss_v) * batch_size
+                    sum_loss_bond += float(loss_bond) * batch_size
                     sum_n += batch_size
                     all_pred_v.append(results['ligand_v_recon'].detach().cpu().numpy())
                     all_true_v.append(batch.ligand_atom_feature_full.detach().cpu().numpy())
@@ -364,6 +373,7 @@ if __name__ == '__main__':
         avg_loss = sum_loss / sum_n
         avg_loss_pos = sum_loss_pos / sum_n
         avg_loss_v = sum_loss_v / sum_n
+        avg_loss_bond = sum_loss_bond / sum_n
 
         if config.train.scheduler.type == 'plateau':
             scheduler.step(avg_loss)
@@ -376,8 +386,8 @@ if __name__ == '__main__':
         atom_auroc = get_auroc(np.concatenate(all_true_v), np.concatenate(all_pred_v, axis=0),
                                feat_mode=config.data.transform.ligand_atom_mode)
         logger.info(
-            '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3 | Avg atom auroc %.6f' % (
-                it, avg_loss, avg_loss_pos, avg_loss_v * 1000, atom_auroc
+            '[Validate] Iter %05d | Loss %.6f | Loss pos %.6f | Loss v %.6f e-3 | Loss bond %.6f | Avg atom auroc %.6f' % (
+                it, avg_loss, avg_loss_pos, avg_loss_v * 1000, avg_loss_bond, atom_auroc
             )
         )
 

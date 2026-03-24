@@ -1,0 +1,32 @@
+[2026-03-18 22:33:51,019::evaluate::INFO] [Docking debug] ligand_filename='BSD_ASPTE_1_130_0/2z3h_A_rec_1wn6_bst_lig_tt_docked_3.sdf', protein_filename='BSD_ASPTE_1_130_0/2z3h_A_rec_1wn6_bst_lig_tt_docked_3_pocket10.pdb', protein_path='./data/test_set/BSD_ASPTE_1_130_0/2z3h_A_rec_1wn6_bst_lig_tt_docked_3_pocket10.pdb', exists=False
+[2026-03-18 22:34:20,764::evaluate::INFO] mol_stable:	0.4000
+[2026-03-18 22:34:20,770::evaluate::INFO] atm_stable:	0.9458
+[2026-03-18 22:34:20,771::evaluate::INFO] recon_success:	1.0000
+[2026-03-18 22:34:20,771::evaluate::INFO] eval_success:	1.0000
+[2026-03-18 22:34:20,772::evaluate::INFO] complete:	1.0000
+[2026-03-18 22:34:20,772::evaluate::INFO] JS bond distances of complete mols: 
+[2026-03-18 22:34:20,773::evaluate::INFO] JSD_6-6|4:	0.6095
+[2026-03-18 22:34:20,773::evaluate::INFO] JSD_6-6|1:	0.4442
+[2026-03-18 22:34:20,774::evaluate::INFO] JSD_6-8|1:	0.6088
+[2026-03-18 22:34:20,774::evaluate::INFO] JSD_6-7|1:	0.4211
+[2026-03-18 22:34:20,774::evaluate::INFO] JSD_6-8|2:	0.6715
+[2026-03-18 22:34:20,774::evaluate::INFO] JSD_6-6|2:	0.4929
+[2026-03-18 22:34:20,775::evaluate::INFO] JSD_6-7|4:	None
+[2026-03-18 22:34:20,775::evaluate::INFO] JSD_6-7|2:	0.7717
+[2026-03-18 22:34:20,775::evaluate::INFO] JSD_CC_2A:	0.2964
+[2026-03-18 22:34:20,776::evaluate::INFO] JSD_All_12A:	0.0914
+[2026-03-18 22:34:20,776::evaluate::INFO] Atom type JS: 0.09022519480081212
+[2026-03-18 22:34:20,776::evaluate::INFO] Number of reconstructed mols: 10, complete mols: 10, evaluated mols: 10
+[2026-03-18 22:34:20,776::evaluate::INFO] QED:   Mean: 0.294 Median: 0.270
+[2026-03-18 22:34:20,777::evaluate::INFO] SA:    Mean: 0.553 Median: 0.550
+[2026-03-18 22:34:20,778::evaluate::INFO] Vina Score:  Mean: -7.634 Median: -7.041
+[2026-03-18 22:34:20,778::evaluate::INFO] Vina Min  :  Mean: -8.264 Median: -7.710
+[2026-03-18 22:34:20,779::evaluate::INFO] ring size: 3 ratio: 0.000
+[2026-03-18 22:34:20,780::evaluate::INFO] ring size: 4 ratio: 0.000
+[2026-03-18 22:34:20,780::evaluate::INFO] ring size: 5 ratio: 0.500
+[2026-03-18 22:34:20,781::evaluate::INFO] ring size: 6 ratio: 0.600
+[2026-03-18 22:34:20,782::evaluate::INFO] ring size: 7 ratio: 0.200
+[2026-03-18 22:34:20,783::evaluate::INFO] ring size: 8 ratio: 0.000
+[2026-03-18 22:34:20,783::evaluate::INFO] ring size: 9 ratio: 0.000
+[2026-03-18 22:34:20,783::evaluate::INFO] METRICS_ONE_LINE_HEAD	mol_stable	 atm_stable	 recon_success	 eval_success	 complete	 JSD_6-6|1	 JSD_6-6|2	 JSD_6-6|4	 JSD_6-7|1	 JSD_6-7|2	 JSD_6-7|4	 JSD_6-8|1	 JSD_6-8|2	 JSD_All_12A	 JSD_CC_2A	 atom_type_js	 n_recon	 n_complete	 n_eval	 QED_mean	 QED_med	 SA_mean	 SA_med	 Vina_score_mean	 Vina_score_med	 Vina_min_mean	 Vina_min_med
+[2026-03-18 22:34:20,784::evaluate::INFO] METRICS_ONE_LINE_VAL	0.4000	 0.9458	 1.0000	 1.0000	 1.0000	 0.4442	 0.4929	 0.6095	 0.4211	 0.7717	 N/A	 0.6088	 0.6715	 0.0914	 0.2964	 0.0902	 10	 10	 10	 0.2944	 0.2701	 0.5530	 0.5500	 -7.6338	 -7.0410	 -8.2639	 -7.7095

@@ -222,19 +222,12 @@ class ScorePosNet3D(nn.Module):
         self.model_mean_type = config.model_mean_type  # ['noise', 'C0']
         self.loss_v_weight = config.loss_v_weight
         self.loss_pos_weight = config.loss_pos_weight if hasattr(config, 'loss_pos_weight') else 1.0
-        # self.v_mode = config.v_mode
-        # assert self.v_mode == 'categorical'
-        # self.v_net_type = getattr(config, 'v_net_type', 'mlp')
-        # self.bond_loss = getattr(config, 'bond_loss', False)
-        # self.bond_net_type = getattr(config, 'bond_net_type', 'pre_att')
-        # self.loss_bond_weight = getattr(config, 'loss_bond_weight', 0.)
-        # self.loss_non_bond_weight = getattr(config, 'loss_non_bond_weight', 0.)
+        # Bond loss hyperparams
+        self.bond_loss = getattr(config, 'bond_loss', False)
+        self.loss_bond_weight = getattr(config, 'loss_bond_weight', 1.0)
+        self.loss_non_bond_weight = getattr(config, 'loss_non_bond_weight', 0.1)
 
         self.sample_time_method = config.sample_time_method  # ['importance', 'symmetric']
-        # self.loss_pos_type = config.loss_pos_type  # ['mse', 'kl']
-        # print(f'Loss pos mode {self.loss_pos_type} applied!')
-        # print(f'Loss bond net type: {self.bond_net_type} '
-        #       f'bond weight: {self.loss_bond_weight} non bond weight: {self.loss_non_bond_weight}')
 
         if config.beta_schedule == 'cosine':
             alphas = cosine_beta_schedule(config.num_diffusion_timesteps, config.pos_beta_s) ** 2
@@ -350,6 +343,16 @@ class ScorePosNet3D(nn.Module):
             ShiftedSoftplus(),
             nn.Linear(self.hidden_dim, ligand_atom_feature_dim),
         )
+        # Bond prediction head: MLP([h_i, h_j, d_ij]) -> R^5
+        # 5 classes: no_bond(0), single(1), double(2), triple(3), aromatic(4)
+        if self.bond_loss:
+            self.bond_inference = nn.Sequential(
+                nn.Linear(self.hidden_dim * 2 + 1, self.hidden_dim),
+                ShiftedSoftplus(),
+                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+                ShiftedSoftplus(),
+                nn.Linear(self.hidden_dim // 2, 5),
+            )
 
     def get_edm_scaling(self, sigma):
         """EDM scaling coefficients: c_skip, c_out, c_in, c_noise (Karras et al.)."""
@@ -518,6 +521,21 @@ class ScorePosNet3D(nn.Module):
             'final_h': final_h,
             'final_ligand_h': final_ligand_h
         }
+        # Bond logits: computed per-graph to handle variable ligand sizes in batch
+        if self.bond_loss:
+            num_graphs = batch_ligand.max().item() + 1
+            pred_bond_logits_list = []
+            for g in range(num_graphs):
+                mask_g = (batch_ligand == g)
+                h_g = final_ligand_h[mask_g]          # (N_g, H)
+                pos_g = final_ligand_pos[mask_g]      # (N_g, 3)
+                N_g = h_g.shape[0]
+                hi = h_g.unsqueeze(1).expand(-1, N_g, -1)   # (N_g, N_g, H)
+                hj = h_g.unsqueeze(0).expand(N_g, -1, -1)   # (N_g, N_g, H)
+                dij = (pos_g.unsqueeze(1) - pos_g.unsqueeze(0)).norm(dim=-1, keepdim=True)  # (N_g, N_g, 1)
+                bond_feat = torch.cat([hi, hj, dij], dim=-1)  # (N_g, N_g, 2H+1)
+                pred_bond_logits_list.append(self.bond_inference(bond_feat))  # (N_g, N_g, 5)
+            preds['pred_bond_logits'] = pred_bond_logits_list
         if return_all:
             final_all_pos, final_all_h = outputs['all_x'], outputs['all_h']
             final_all_ligand_pos = [pos[mask_ligand] for pos in final_all_pos]
@@ -644,7 +662,8 @@ class ScorePosNet3D(nn.Module):
         return loss_v
 
     def get_diffusion_loss(
-            self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, time_step=None
+            self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand,
+            time_step=None, ligand_bond_index=None, ligand_bond_type=None, ligand_bond_type_batch=None
     ):
         num_graphs = batch_protein.max().item() + 1
         protein_pos, ligand_pos, _ = center_pos_rescale(
@@ -704,9 +723,33 @@ class ScorePosNet3D(nn.Module):
             loss_v = scatter_mean(loss_v, batch_ligand, dim=0).mean()
 
             loss = self.loss_pos_weight * loss_pos + self.loss_v_weight * loss_v
+
+            # Bond loss: explicit bond type prediction
+            loss_bond = torch.tensor(0., device=device)
+            if self.bond_loss and ligand_bond_index is not None and 'pred_bond_logits' in preds:
+                from datasets.pl_data import get_batch_connectivity_matrix
+                bond_weight = torch.ones(5, device=device)
+                bond_weight[0] = self.loss_non_bond_weight  # suppress no-bond class
+                bond_gt_matrices = get_batch_connectivity_matrix(
+                    batch_ligand, ligand_bond_index, ligand_bond_type, ligand_bond_type_batch
+                )
+                pred_bond_logits_list = preds['pred_bond_logits']
+                bond_loss_per_graph = []
+                for g_logits, g_gt in zip(pred_bond_logits_list, bond_gt_matrices):
+                    g_gt = g_gt.to(device)
+                    bl = F.cross_entropy(
+                        g_logits.reshape(-1, 5),   # (N_g*N_g, 5)
+                        g_gt.reshape(-1).long(),   # (N_g*N_g,)
+                        weight=bond_weight
+                    )
+                    bond_loss_per_graph.append(bl)
+                loss_bond = torch.stack(bond_loss_per_graph).mean()
+                loss = loss + self.loss_bond_weight * loss_bond
+
             return {
                 'loss_pos': loss_pos,
                 'loss_v': loss_v,
+                'loss_bond': loss_bond,
                 'loss': loss,
                 'x0': ligand_pos,
                 'pred_ligand_pos': pred_ligand_pos,
