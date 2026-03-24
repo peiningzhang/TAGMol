@@ -1,7 +1,7 @@
 #!/bin/bash
 
-SCHEDULERS=("log_uniform" "arcsin" "edm" "edm1")
-
+# SCHEDULERS=("log_uniform" "arcsin" "edm" "edm1")
+SCHEDULERS=("log_uniform" "arcsin" "edm1")
 for SCHED in "${SCHEDULERS[@]}"
 do
     echo "=========================================================="

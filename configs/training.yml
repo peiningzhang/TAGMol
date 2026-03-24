@@ -13,7 +13,7 @@ model:
   beta_schedule: sigmoid
 
   # EDM coordinate parameters (VEDA)
-  sigma_data: 1
+  sigma_data: 2
   sigma_min: 0.0002
   sigma_max: 160
   rho: 2.0
