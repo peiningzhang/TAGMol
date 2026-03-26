@@ -1,0 +1,33 @@
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+
+guide_models:
+  - name: qed
+    checkpoint: logs/training_dock_guide_qed_veda_2026_03_23__21_23_50/checkpoints/last.pt
+    weight: 0.33
+    guide_kind: Kd
+    gradient_scale_cord: 0.1
+    gradient_scale_categ: -10.0 #1e-10
+    clamp_pred_max: 1.0
+  - name: sa
+    checkpoint: logs/training_dock_guide_sa_veda_2026_03_24__00_06_50/checkpoints/last.pt
+    weight: 0.33
+    guide_kind: Kd
+    gradient_scale_cord: 0.1
+    gradient_scale_categ: -10.0 #1e-10
+    clamp_pred_max: 1.0
+  - name: binding_affinity
+    checkpoint: logs/training_dock_guide_veda_2026_03_18__16_14_08/checkpoints/last.pt
+    weight: 0.34
+    guide_kind: Kd
+    gradient_scale_cord: 2.0
+    gradient_scale_categ: -100.0 #1e-10
+
+sample:
+  seed: 2021
+  num_samples: 10
+  num_steps: 1000
+  pos_only: False
+  center_pos_mode: protein
+  sample_num_atoms: prior
+

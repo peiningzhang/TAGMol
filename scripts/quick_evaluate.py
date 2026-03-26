@@ -5,6 +5,7 @@ import subprocess
 from datetime import datetime
 
 import torch
+import yaml
 from torch_geometric.transforms import Compose
 
 import utils.misc as misc
@@ -37,6 +38,7 @@ def main():
     parser.add_argument('--guide_kind', type=int, default=2, help='Prior kind to guide to (default=2 i.e., Kd).')
     parser.add_argument('--time_scheduler', type=str, default=None, help='Time scheduler to use, overriding config.')
     parser.add_argument('--num_steps', type=int, default=None, help='Number of diffusion steps for sampling, overriding config.')
+    parser.add_argument('--sample_config', type=str, default=None, help='Path to a yaml that defines guide_models (checkpoint, weight, gradient_scale_cord, gradient_scale_categ). Overrides --guide_checkpoints and related args.')
     args = parser.parse_args()
 
     # Load global config (data split, seeds, etc.)
@@ -45,11 +47,11 @@ def main():
 
     # Temporary directory for results
     os.makedirs(args.tmp_root, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y_%m_%d__%H_%M_%S')
-    tmp_dir = tempfile.mkdtemp(prefix=f'quick_eval_{timestamp}_', dir=args.tmp_root)
+    timestamp = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
+    tmp_dir = tempfile.mkdtemp(prefix=f"quick_eval_{timestamp}_", dir=args.tmp_root)
 
-    logger = misc.get_logger('quick_eval', log_dir=None)
-    logger.info(f'Temporary evaluation directory: {tmp_dir}')
+    logger = misc.get_logger("quick_eval", log_dir=None)
+    logger.info(f"Temporary evaluation directory: {tmp_dir}")
 
     # Load the score (generation) model checkpoint
     ckpt = torch.load(args.checkpoint, map_location=args.device)
@@ -62,13 +64,16 @@ def main():
     transform = Compose([protein_featurizer, ligand_featurizer, trans.FeaturizeLigandBond()])
 
     # Load dataset (test split) using the transforms above
-    logger.info('Loading dataset (test split)...')
+    logger.info("Loading dataset (test split)...")
     dataset, subsets = get_dataset(config=config.data, transform=transform)
-    test_set = subsets['test']
-    logger.info(f'Test set size: {len(test_set)}')
+    test_set = subsets["test"]
+    logger.info(f"Test set size: {len(test_set)}")
 
     num_proteins = min(args.num_proteins, len(test_set))
-    logger.info(f'Will evaluate on first {num_proteins} proteins, {args.num_ligands_per_protein} ligands each.')
+    logger.info(
+        f"Will evaluate on first {num_proteins} proteins, "
+        f"{args.num_ligands_per_protein} ligands per protein."
+    )
 
     # Initialise the generation model
     model = ScorePosNet3D(
@@ -79,46 +84,49 @@ def main():
     # Apply CLI overrides if provided
     if args.time_scheduler is not None:
         model.config.time_scheduler = args.time_scheduler
-    elif hasattr(config, 'model') and hasattr(config.model, 'time_scheduler'):
+    elif hasattr(config, "model") and hasattr(config.model, "time_scheduler"):
         model.config.time_scheduler = config.model.time_scheduler
-    if hasattr(config, 'model') and hasattr(config.model, 'rho'):
+    if hasattr(config, "model") and hasattr(config.model, "rho"):
         model.rho = config.model.rho
     if args.num_steps is not None:
         model.num_timesteps = args.num_steps
-    elif hasattr(config, 'model') and hasattr(config.model, 'num_diffusion_timesteps'):
+    elif hasattr(config, "model") and hasattr(config.model, "num_diffusion_timesteps"):
         model.num_timesteps = config.model.num_diffusion_timesteps
-    if hasattr(config, 'model') and hasattr(config.model, 'dfm_type'):
+    if hasattr(config, "model") and hasattr(config.model, "dfm_type"):
         model.config.dfm_type = config.model.dfm_type
-    if hasattr(config, 'model') and hasattr(config.model, 'veda_x_pred_mode'):
+    if hasattr(config, "model") and hasattr(config.model, "veda_x_pred_mode"):
         model.config.veda_x_pred_mode = config.model.veda_x_pred_mode
-    model.load_state_dict(ckpt['model'])
+    model.load_state_dict(ckpt["model"])
     model.eval()
-    logger.info(f'Loaded generation model from {args.checkpoint}')
+    logger.info(f"Loaded model from checkpoint: {args.checkpoint}")
 
     # ---------------------------------------------------------------------
     # Load guidance models (single or multiple)
     # ---------------------------------------------------------------------
     guide_models = []
     guide_configs = []
-    def _make_cfg(weight=1.0, cord=args.guide_scale_cord, categ=args.guide_scale_categ):
-        return {
-            'weight': weight,
-            'gradient_scale_cord': cord,
-            'gradient_scale_categ': categ,
-            'clamp_pred_min': None,
-            'clamp_pred_max': None,
-        }
 
-    # Assemble list of checkpoint paths
-    guide_paths = []
-    if args.guide_checkpoint:
-        guide_paths.append(args.guide_checkpoint)
-    if args.guide_checkpoints:
-        guide_paths.extend(args.guide_checkpoints)
+    if args.sample_config is not None:
+        # Load yaml config defining guide models
+        with open(args.sample_config, 'r') as f:
+            sample_cfg = yaml.safe_load(f)
+        guide_paths = [g['checkpoint'] for g in sample_cfg.get('guide_models', [])]
+        guide_weights = [g.get('weight', 1.0) for g in sample_cfg.get('guide_models', [])]
+        guide_cord = [g.get('gradient_scale_cord', args.guide_scale_cord) for g in sample_cfg.get('guide_models', [])]
+        guide_categ = [g.get('gradient_scale_categ', args.guide_scale_categ) for g in sample_cfg.get('guide_models', [])]
+    else:
+        guide_paths = []
+        if args.guide_checkpoint:
+            guide_paths.append(args.guide_checkpoint)
+        if args.guide_checkpoints:
+            guide_paths.extend(args.guide_checkpoints)
+        guide_weights = [1.0] * len(guide_paths)
+        guide_cord = [args.guide_scale_cord] * len(guide_paths)
+        guide_categ = [args.guide_scale_categ] * len(guide_paths)
 
     if guide_paths:
         logger.info(f'Loading {len(guide_paths)} guidance models...')
-        for gp in guide_paths:
+        for gp, w, cord, categ in zip(guide_paths, guide_weights, guide_cord, guide_categ):
             guide_ckpt = torch.load(gp, map_location=args.device)
             guide_model = DockGuideNet3D(
                 guide_ckpt['config'].model,
@@ -128,7 +136,13 @@ def main():
             guide_model.load_state_dict(guide_ckpt['model'])
             guide_model.eval()
             guide_models.append(guide_model)
-            guide_configs.append(_make_cfg())
+            guide_configs.append({
+                'weight': w,
+                'gradient_scale_cord': cord,
+                'gradient_scale_categ': categ,
+                'clamp_pred_min': None,
+                'clamp_pred_max': None,
+            })
     else:
         guide_models = None
         guide_configs = None
@@ -138,7 +152,7 @@ def main():
     # ---------------------------------------------------------------------
     for data_id in range(num_proteins):
         data = test_set[data_id]
-        logger.info(f'Sampling for protein index {data_id}...')
+        logger.info(f"Sampling for protein index {data_id}...")
 
         if guide_models is not None:
             # Multi‑guide diffusion
@@ -198,21 +212,21 @@ def main():
             'pred_ligand_vt_traj': pred_vt_traj,
             'time': time_list,
         }
-        if args.docking_mode != 'none':
-            result['ligand_filename'] = getattr(data, 'ligand_filename', None)
-            result['protein_filename'] = getattr(data, 'protein_filename', None)
+        if args.docking_mode != "none":
+            result["ligand_filename"] = getattr(data, "ligand_filename", None)
+            result["protein_filename"] = getattr(data, "protein_filename", None)
 
-        out_path = os.path.join(tmp_dir, f'result_{data_id}.pt')
+        out_path = os.path.join(tmp_dir, f"result_{data_id}.pt")
         torch.save(result, out_path)
-        logger.info(f'Saved sampling result to: {out_path}')
+        logger.info(f"Saved sampling result to: {out_path}")
 
     # ---------------------------------------------------------------------
     # Run evaluation script on the generated samples
     # ---------------------------------------------------------------------
     logger.info('Running evaluation on generated samples...')
     eval_cmd = [
-        'python',
-        'scripts/evaluate_diffusion.py',
+        "python",
+        "scripts/evaluate_diffusion.py",
         tmp_dir,
         '--eval_step', str(args.eval_step),
         '--eval_num_examples', str(num_proteins),
@@ -223,10 +237,12 @@ def main():
     if args.docking_mode != 'none':
         eval_cmd += ['--verbose', 'True']
         eval_cmd += ['--protein_root', args.protein_root, '--exhaustiveness', str(args.exhaustiveness)]
-    logger.info(f'Eval command: {' '.join(eval_cmd)}')
+    logger.info(f"Eval command: {' '.join(eval_cmd)}")
     subprocess.run(eval_cmd, check=False)
 
-    logger.info('Quick evaluation finished.')
+    logger.info("Quick evaluation finished.")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
+
