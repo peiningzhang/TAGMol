@@ -198,6 +198,45 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
+def _flat_bond_to_index_type(ligand_bond_flat, num_atoms_per_graph, device):
+    """Convert flat bond-state vector back to (bond_index, bond_type) format.
+
+    ligand_bond_flat: (total_pairs,) LongTensor, where total_pairs = sum_g N_g^2.
+    Each element represents the bond type for the (i, j) pair within graph g.
+    Class 0 = no bond; classes 1-4 = single, double, triple, aromatic.
+
+    Returns:
+        bond_index (2, E): global atom indices for non-bond edges
+        bond_type  (E,):  bond classes for those edges
+    """
+    row_idx_list, col_idx_list, btype_list = [], [], []
+    atom_offset = 0
+    pair_offset = 0
+    for n in num_atoms_per_graph.tolist():
+        n = int(n)
+        flat_g = ligand_bond_flat[pair_offset: pair_offset + n * n]  # (n*n,)
+        # Only keep non-bond (class != 0) entries
+        nonzero_mask = flat_g != 0
+        if nonzero_mask.any():
+            idxs = nonzero_mask.nonzero(as_tuple=False).squeeze(-1)  # local flat indices
+            rows = idxs // n + atom_offset  # global row (src) atom index
+            cols = idxs % n + atom_offset   # global col (dst) atom index
+            row_idx_list.append(rows)
+            col_idx_list.append(cols)
+            btype_list.append(flat_g[idxs])
+        atom_offset += n
+        pair_offset += n * n
+
+    if len(row_idx_list) == 0:
+        return None, None
+    bond_index = torch.stack([
+        torch.cat(row_idx_list),
+        torch.cat(col_idx_list)
+    ], dim=0)  # (2, E)
+    bond_type = torch.cat(btype_list)  # (E,)
+    return bond_index, bond_type
+
+
 # Model
 class ScorePosNet3D(nn.Module):
 
@@ -228,6 +267,7 @@ class ScorePosNet3D(nn.Module):
         self.loss_non_bond_weight = getattr(config, 'loss_non_bond_weight', 0.1)
 
         self.sample_time_method = config.sample_time_method  # ['importance', 'symmetric']
+        self.bond_input = getattr(config, 'bond_input', False)
 
         if config.beta_schedule == 'cosine':
             alphas = cosine_beta_schedule(config.num_diffusion_timesteps, config.pos_beta_s) ** 2
@@ -353,6 +393,10 @@ class ScorePosNet3D(nn.Module):
                 ShiftedSoftplus(),
                 nn.Linear(self.hidden_dim // 2, 5),
             )
+            # Bond context projector: bond_type one-hot counts (5-dim) -> emb_dim
+            # Projects per-atom bond statistics into hidden space and adds to ligand embedding
+            if self.bond_input:
+                self.bond_context_projector = nn.Linear(5, emb_dim)
 
     def get_edm_scaling(self, sigma):
         """EDM scaling coefficients: c_skip, c_out, c_in, c_noise (Karras et al.)."""
@@ -363,17 +407,27 @@ class ScorePosNet3D(nn.Module):
         c_noise = torch.log(sigma.clamp(min=1e-12)) / 4
         return c_skip, c_out, c_in, c_noise
 
-    def sample_discrete_dfm_noise(self, v_1, sigma, batch):
-        """Exact DFM: sample v_t from P(v_t|v_1) = kappa_t * OneHot(v_1) + (1-kappa_t) / S.
-        Uses non-linear kappa(t), not linear t."""
-        mask_rate = self.dfm_scheduler.mask_rate(sigma)  # shape (num_graphs,) or (num_atoms,)
-        if mask_rate.dim() == 1 and len(mask_rate) == batch.max().item() + 1:
-            mask_rate = mask_rate[batch].unsqueeze(-1)  # (num_atoms, 1)
+    def _sample_discrete_dfm_noise(self, v_1, sigma, batch, num_classes):
+        """Generalized DFM noising: sample v_t from P(v_t|v_1) = (1-kappa_t) * OneHot(v_1) + kappa_t / S.
+        
+        Args:
+            v_1: Ground truth discrete state (LongTensor)
+            sigma: Current diffusion noise level
+            batch: Batch index mapping
+            num_classes: S (number of categories)
+        """
+        mask_rate = self.dfm_scheduler.mask_rate(sigma)
+        if mask_rate.dim() == 1 and len(mask_rate) == (batch.max().item() + 1):
+            mask_rate = mask_rate[batch].unsqueeze(-1)
         elif mask_rate.dim() == 1:
             mask_rate = mask_rate.unsqueeze(-1)
-        S = self.num_classes
-        prob = (1 - mask_rate) * F.one_hot(v_1, S).float() + mask_rate / S
+        
+        prob = (1 - mask_rate) * F.one_hot(v_1, num_classes).float() + mask_rate / num_classes
         return torch.distributions.Categorical(prob).sample()
+
+    def sample_discrete_dfm_noise(self, v_1, sigma, batch):
+        # Backward compatibility for atom type noising
+        return self._sample_discrete_dfm_noise(v_1, sigma, batch, self.num_classes)
 
     def get_sigma_schedule(self, num_steps, device, scheduler='log_uniform'):
         """VEDA: sigma schedule from sigma_max to sigma_min. t: 1 -> 0."""
@@ -422,7 +476,9 @@ class ScorePosNet3D(nn.Module):
             raise NotImplementedError(f"scheduler {scheduler}")
         return sigma
 
-    def forward(self, protein_pos, protein_v, batch_protein, init_ligand_pos, init_ligand_v, batch_ligand, sigma=None, return_all=False, fix_x=False, guide=None):
+    def forward(self, protein_pos, protein_v, batch_protein, init_ligand_pos, init_ligand_v, batch_ligand,
+                sigma=None, return_all=False, fix_x=False, guide=None,
+                init_ligand_bond_index=None, init_ligand_bond_type=None):
         """_summary_
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -475,6 +531,21 @@ class ScorePosNet3D(nn.Module):
         ## convert one-hot features into the embedding space
         h_protein = self.protein_atom_emb(protein_v)
         init_ligand_h = self.ligand_atom_emb(input_ligand_feat)
+
+        # ── Bond context injection ───────────────────────────────────────────
+        # For each atom i, aggregate the one-hot bond types of all edges (i, j).
+        # bond_context shape: (N_atoms, 5) - counts of each bond type attached to atom i.
+        if self.bond_input and init_ligand_bond_index is not None and init_ligand_bond_type is not None:
+            num_atoms = init_ligand_v.shape[0]
+            bond_one_hot = F.one_hot(init_ligand_bond_type.long(), num_classes=5).float()  # (E, 5)
+            bond_context = scatter_sum(
+                bond_one_hot,
+                init_ligand_bond_index[0],
+                dim=0,
+                dim_size=num_atoms
+            )  # (N_atoms, 5)
+            # Project to emb_dim and add to ligand embedding (residual, no dim change)
+            init_ligand_h = init_ligand_h + self.bond_context_projector(bond_context)
 
         ## add 0 to the end of hidden embedding of protein for every atom
         ## add 1 to the end of hidden embedding of protein for every atom
@@ -700,10 +771,40 @@ class ScorePosNet3D(nn.Module):
             pos_noise = torch.randn_like(ligand_pos, device=device)
             ligand_pos_perturbed = ligand_pos + sigma_per_atom * pos_noise
 
-            # Exact DFM noising: P(v_t|v_1) = kappa_t * OneHot(v_1) + (1-kappa_t) / S
+            # Discrete FM noising: P(v_t|v_0)
             ligand_v_perturbed = self.sample_discrete_dfm_noise(ligand_v, sigma_per_atom, batch_ligand)
+
+            # ── Bond DFM noising (for training feedback loop) ────────────────
+            noisy_bond_index, noisy_bond_type = None, None
+            if self.bond_loss and ligand_bond_index is not None:
+                from datasets.pl_data import get_batch_connectivity_matrix
+                # 1. Build GT flat bond state for all pairs (N^2)
+                # This ensures the model learns on both existing and non-existing bond noise.
+                bond_gt_matrices = get_batch_connectivity_matrix(
+                    batch_ligand, ligand_bond_index, ligand_bond_type, ligand_bond_type_batch
+                )
+                ligand_bond_flat = torch.cat([m.reshape(-1) for m in bond_gt_matrices], dim=0).long().to(device) # (total_pairs,)
+                
+                # 2. Get batch mapping for bonds to apply correct sigma
+                num_atoms_per_graph = scatter_sum(torch.ones_like(batch_ligand), batch_ligand, dim=0)
+                num_pairs_per_graph = num_atoms_per_graph ** 2
+                batch_bond = torch.repeat_interleave(
+                    torch.arange(num_graphs, device=device), num_pairs_per_graph
+                )
+                
+                # 3. Apply DFM noising (S=5 bond classes)
+                # sigma_per_graph is used here
+                ligand_bond_flat_perturbed = self._sample_discrete_dfm_noise(
+                    ligand_bond_flat, sigma, batch_bond, num_classes=5
+                )
+                
+                # 4. Convert back to (index, type) to pass into GNN context
+                noisy_bond_index, noisy_bond_type = _flat_bond_to_index_type(
+                    ligand_bond_flat_perturbed, num_atoms_per_graph, device
+                )
+
             _, c_out, _, _ = self.get_edm_scaling(sigma_per_atom)
-            # Forward with sigma and t
+            # Forward with sigma, noisy atom types AND noisy bond stats
             preds = self(
                 protein_pos=protein_pos,
                 protein_v=protein_v,
@@ -711,7 +812,9 @@ class ScorePosNet3D(nn.Module):
                 init_ligand_pos=ligand_pos_perturbed,
                 init_ligand_v=ligand_v_perturbed,
                 batch_ligand=batch_ligand,
-                sigma=sigma_per_atom
+                sigma=sigma_per_atom,
+                init_ligand_bond_index=noisy_bond_index,
+                init_ligand_bond_type=noisy_bond_type,
             )
             pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
@@ -942,6 +1045,63 @@ class ScorePosNet3D(nn.Module):
 
         return ligand_v_next, p_step, p_1_given_t
 
+    def campbell_dfm_step_bond(self, ligand_bond_flat, pred_bond_logits_flat, sigma_i, sigma_next,
+                                batch_bond, num_graphs, eps=1e-5):
+        """
+        Campbell-style discrete update for bond types.
+        Identical math to campbell_dfm_step; works on the flattened (N_pairs, 5) representation.
+
+        Args:
+            ligand_bond_flat  (LongTensor):  (total_pairs,)  current bond-type per (i,j) pair
+            pred_bond_logits_flat (Tensor):  (total_pairs, 5) predicted clean logits from Bond Head
+            sigma_i, sigma_next: (num_graphs, 1)  - same sigma schedule as atoms
+            batch_bond (LongTensor):  (total_pairs,)  which graph each (i,j) pair belongs to
+            num_graphs (int)
+        Returns:
+            bond_next (LongTensor): (total_pairs,) updated bond-type
+            p_step (Tensor): (total_pairs, 5) step probability (for logging)
+            p_1_given_t (Tensor): (total_pairs, 5)
+        """
+        S = 5  # bond classes: 0=no_bond, 1=single, 2=double, 3=triple, 4=aromatic
+        device = pred_bond_logits_flat.device
+
+        p_1_given_t = F.softmax(pred_bond_logits_flat, dim=-1)  # (total_pairs, 5)
+
+        # Reuse dfm_scheduler (same sigma / mask_rate as atoms)
+        mask_rate      = self.dfm_scheduler.mask_rate(sigma_i)[batch_bond]       # (total_pairs, 1)
+        mask_rate_next = self.dfm_scheduler.mask_rate(sigma_next)[batch_bond]    # (total_pairs, 1)
+        t      = 1.0 - mask_rate
+        t_next = 1.0 - mask_rate_next
+        dt = (t_next - t).clamp(min=0.0)
+
+        alpha_t      = t.clamp(min=0.0, max=1.0 - 1e-6)
+        alpha_t_next = t_next.clamp(min=0.0, max=1.0 - 1e-6)
+        alpha_t_prime = (alpha_t_next - alpha_t) / dt.clamp(min=1e-12)
+
+        stochasticity = float(getattr(self.config, 'campbell_stochasticity', 2.0))
+        stochasticity = stochasticity / self.dfm_scheduler.mask_rate_derivative(sigma_i)
+        stochasticity = stochasticity[batch_bond]  # (total_pairs, 1)
+
+        unmask_prob = dt * (alpha_t_prime + stochasticity * alpha_t) / (1.0 - alpha_t).clamp(min=eps)
+        mask_prob   = dt * stochasticity
+        unmask_prob = unmask_prob.clamp(min=0.0, max=1.0)
+        mask_prob   = mask_prob.clamp(min=0.0, max=1.0)
+        unmask_prob = unmask_prob / (unmask_prob + mask_prob)
+
+        x1 = torch.distributions.Categorical(probs=p_1_given_t).sample()  # (total_pairs,)
+        will_unmask = (torch.rand(ligand_bond_flat.shape[0], device=device) < unmask_prob.squeeze(-1))
+
+        bond_next = ligand_bond_flat.clone()
+        bond_next[will_unmask] = x1[will_unmask]
+
+        X_t     = F.one_hot(ligand_bond_flat, num_classes=S).float()
+        uniform = torch.full_like(p_1_given_t, 1.0 / S)
+        p_step  = (1.0 - unmask_prob - mask_prob).clamp(min=0.0) * X_t + unmask_prob * p_1_given_t + mask_prob * uniform
+        p_step  = torch.clamp(p_step, min=1e-9)
+        p_step  = p_step / p_step.sum(dim=-1, keepdim=True)
+
+        return bond_next, p_step, p_1_given_t
+
     # def campbell_dfm_step(self, ligand_v, pred_ligand_v, sigma_i, sigma_next, batch_ligand, eps=1e-5):
     #     """
     #     Campbell-style discrete update (no explicit mask token).
@@ -1035,7 +1195,23 @@ class ScorePosNet3D(nn.Module):
 
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
+        bond_traj = []  # list of (total_pairs,) LongTensor per step
         ligand_pos, ligand_v = init_ligand_pos*self.sigma_max, init_ligand_v
+        sample_bond = getattr(self.config, 'sample_bond', False)
+
+        # ── Bond DFM state initialisation (if bond_loss and sample_bond enabled) 
+        if self.bond_loss and sample_bond:
+            # build batch_bond: for each graph g with N_g atoms, N_g*N_g pairs all belong to g
+            num_atoms_per_graph = scatter_sum(torch.ones_like(batch_ligand), batch_ligand, dim=0)  # (num_graphs,)
+            num_pairs_per_graph = num_atoms_per_graph ** 2                                         # (num_graphs,)
+            batch_bond = torch.repeat_interleave(
+                torch.arange(num_graphs, device=init_ligand_pos.device), num_pairs_per_graph
+            )  # (total_pairs,)
+            total_pairs = batch_bond.shape[0]
+            # Uniform prior: sample each (i,j) ~ Uniform({0,1,2,3,4})
+            ligand_bond_flat = torch.randint(0, 5, (total_pairs,), device=init_ligand_pos.device)
+        else:
+            batch_bond = ligand_bond_flat = None
 
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + Exact DFM with Predictor-Corrector (v) ===
@@ -1087,6 +1263,11 @@ class ScorePosNet3D(nn.Module):
                         ligand_v[mask_mask] = torch.distributions.Categorical(probs=self.prior_dist).sample((num_masked,)).to(ligand_v.device)
                 sigma_per_atom = sigma_i[batch_ligand]
                 sigma_next_per_atom = sigma_next[batch_ligand]
+                # ── reconstruct bond_index/bond_type from flat bond state ──────────
+                sd_bond_index, sd_bond_type = None, None
+                if sample_bond and ligand_bond_flat is not None:
+                    sd_bond_index, sd_bond_type = _flat_bond_to_index_type(
+                        ligand_bond_flat, num_atoms_per_graph, batch_ligand.device)
                 preds = self(
                     protein_pos=protein_pos,
                     protein_v=protein_v,
@@ -1094,7 +1275,9 @@ class ScorePosNet3D(nn.Module):
                     init_ligand_pos=ligand_pos,
                     init_ligand_v=ligand_v,
                     batch_ligand=batch_ligand,
-                    sigma=sigma_per_atom
+                    sigma=sigma_per_atom,
+                    init_ligand_bond_index=sd_bond_index,
+                    init_ligand_bond_type=sd_bond_type,
                 )
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
@@ -1116,12 +1299,26 @@ class ScorePosNet3D(nn.Module):
                         sigma_next=sigma_next,
                         batch_ligand=batch_ligand,
                         eps=eps,
-                        # last_step=step == n_dfm-1
                     )
                     v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
                     vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
 
-                    # ligand_v = torch.distributions.Categorical(probs=F.softmax(pred_ligand_v, dim=-1)).sample()
+                # ── Bond DFM update (Campbell) ────────────────────────────────
+                if self.bond_loss and sample_bond and 'pred_bond_logits' in preds:
+                    # Flatten per-graph logits into (total_pairs, 5)
+                    pred_bond_logits_flat = torch.cat(
+                        [lg.reshape(-1, 5) for lg in preds['pred_bond_logits']], dim=0
+                    )
+                    ligand_bond_flat, _, _ = self.campbell_dfm_step_bond(
+                        ligand_bond_flat=ligand_bond_flat,
+                        pred_bond_logits_flat=pred_bond_logits_flat,
+                        sigma_i=sigma_i,
+                        sigma_next=sigma_next,
+                        batch_bond=batch_bond,
+                        num_graphs=num_graphs,
+                        eps=eps,
+                    )
+                    bond_traj.append(ligand_bond_flat.clone().cpu())
 
 
                 if step in [0, n_dfm//2, n_dfm-1] and (ligand_pos.shape[0] > 0):
@@ -1146,6 +1343,12 @@ class ScorePosNet3D(nn.Module):
             ligand_pos = pred_ligand_pos
             ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
             ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
+            if self.bond_loss and sample_bond and 'pred_bond_logits' in preds:
+                pred_bond_flat = torch.cat(
+                    [lg.reshape(-1, 5).argmax(dim=-1) for lg in preds['pred_bond_logits']], dim=0
+                )
+            else:
+                pred_bond_flat = None
             return {
                 'pos': ligand_pos,
                 'v': ligand_v,
@@ -1153,7 +1356,11 @@ class ScorePosNet3D(nn.Module):
                 'pos0_traj': pos0_traj,
                 'v_traj': v_traj,
                 'v0_traj': v0_pred_traj,
-                'vt_traj': vt_pred_traj
+                'vt_traj': vt_pred_traj,
+                'bond_traj': bond_traj,
+                'pred_bond': pred_bond_flat,
+                'batch_bond': batch_bond,
+                'num_atoms_per_graph': num_atoms_per_graph if self.bond_loss and sample_bond else None,
             }
 
         elif self.diffusion_type == 'ddpm':
@@ -1183,9 +1390,21 @@ class ScorePosNet3D(nn.Module):
 
             pos_traj, v_traj = [], []
             v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
+            bond_traj = []
             ligand_pos, ligand_v = init_ligand_pos * self.sigma_max, init_ligand_v
-
             discrete_update = self.campbell_dfm_step if getattr(self.config, 'dfm_type', 'gat') == 'campbell' else self.gat_dfm_step
+            sample_bond = getattr(self.config, 'sample_bond', False)
+
+            # ── Bond DFM init ─────────────────────────────────────────────────
+            if self.bond_loss and sample_bond:
+                num_atoms_per_graph = scatter_sum(torch.ones_like(batch_ligand), batch_ligand, dim=0)
+                num_pairs_per_graph = num_atoms_per_graph ** 2
+                batch_bond_g = torch.repeat_interleave(
+                    torch.arange(num_graphs, device=device), num_pairs_per_graph
+                )
+                ligand_bond_flat = torch.randint(0, 5, (batch_bond_g.shape[0],), device=device)
+            else:
+                batch_bond_g = ligand_bond_flat = None
 
             for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
@@ -1222,6 +1441,11 @@ class ScorePosNet3D(nn.Module):
                 
                 sigma_per_atom = sigma_i[batch_ligand]
                 sigma_next_per_atom = sigma_next[batch_ligand]
+                # ── reconstruct bond_index/bond_type from flat bond state ──────────
+                sg_bond_index, sg_bond_type = None, None
+                if sample_bond and ligand_bond_flat is not None:
+                    sg_bond_index, sg_bond_type = _flat_bond_to_index_type(
+                        ligand_bond_flat, num_atoms_per_graph, batch_ligand.device)
                 with torch.no_grad():
                     preds = self(
                         protein_pos=protein_pos,
@@ -1230,7 +1454,9 @@ class ScorePosNet3D(nn.Module):
                         init_ligand_pos=ligand_pos,
                         init_ligand_v=ligand_v,
                         batch_ligand=batch_ligand,
-                        sigma=sigma_per_atom
+                        sigma=sigma_per_atom,
+                        init_ligand_bond_index=sg_bond_index,
+                        init_ligand_bond_type=sg_bond_type,
                     )
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
@@ -1260,11 +1486,7 @@ class ScorePosNet3D(nn.Module):
                 print("shift_guided.abs().mean().item()", (gradient_scale_cord * ligand_pos_grad).abs().mean().item())
                 if not pos_only:
                     if gradient_scale_categ != 0 and ligand_v_grad is not None:
-                        # 指南：在预测的 x_0 logits (对数概率空间) 加上 Guidance 梯度
-                        # 确保梯度方向能够激发目标类别的对数概率
                         guided_pred_ligand_v = pred_ligand_v + gradient_scale_categ * ligand_v_grad
-                        print("shift_guided_v.abs().mean().item()", (gradient_scale_categ * ligand_v_grad).abs().mean().item())
-                        print("pred_ligand_v.abs().mean().item()", pred_ligand_v.abs().mean().item())
                     else:
                         guided_pred_ligand_v = pred_ligand_v
                     ligand_v, p_step, p_1_given_t = discrete_update(
@@ -1278,6 +1500,22 @@ class ScorePosNet3D(nn.Module):
                     v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
                     vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
 
+                # ── Bond DFM update ───────────────────────────────────────────
+                if self.bond_loss and sample_bond and batch_bond_g is not None and 'pred_bond_logits' in preds:
+                    pred_bond_logits_flat = torch.cat(
+                        [lg.reshape(-1, 5) for lg in preds['pred_bond_logits']], dim=0
+                    )
+                    ligand_bond_flat, _, _ = self.campbell_dfm_step_bond(
+                        ligand_bond_flat=ligand_bond_flat,
+                        pred_bond_logits_flat=pred_bond_logits_flat,
+                        sigma_i=sigma_i,
+                        sigma_next=sigma_next,
+                        batch_bond=batch_bond_g,
+                        num_graphs=num_graphs,
+                        eps=eps,
+                    )
+                    bond_traj.append(ligand_bond_flat.clone().cpu())
+
                 ori_ligand_pos0 = pred_ligand_pos / self.rescale_factor + offset[batch_ligand]
                 ori_ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
@@ -1287,6 +1525,12 @@ class ScorePosNet3D(nn.Module):
             ligand_pos = pred_ligand_pos
             ligand_v = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
             ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
+            if self.bond_loss and sample_bond and 'pred_bond_logits' in preds:
+                pred_bond_flat = torch.cat(
+                    [lg.reshape(-1, 5).argmax(dim=-1) for lg in preds['pred_bond_logits']], dim=0
+                )
+            else:
+                pred_bond_flat = None
             return {
                 'pos': ligand_pos,
                 'v': ligand_v,
@@ -1294,7 +1538,11 @@ class ScorePosNet3D(nn.Module):
                 'pos0_traj': pos0_traj,
                 'v_traj': v_traj,
                 'v0_traj': v0_pred_traj,
-                'vt_traj': vt_pred_traj
+                'vt_traj': vt_pred_traj,
+                'bond_traj': bond_traj,
+                'pred_bond': pred_bond_flat,
+                'batch_bond': batch_bond_g,
+                'num_atoms_per_graph': num_atoms_per_graph if self.bond_loss and sample_bond else None,
             }
         elif self.diffusion_type == 'ddpm':
             raise NotImplementedError
@@ -1323,9 +1571,21 @@ class ScorePosNet3D(nn.Module):
 
             pos_traj, v_traj = [], []
             v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
+            bond_traj = []
             ligand_pos, ligand_v = init_ligand_pos * self.sigma_max, init_ligand_v
-
             discrete_update = self.campbell_dfm_step if getattr(self.config, 'dfm_type', 'gat') == 'campbell' else self.gat_dfm_step
+            sample_bond = getattr(self.config, 'sample_bond', False)
+
+            # ── Bond DFM init ─────────────────────────────────────────────────
+            if self.bond_loss and sample_bond:
+                num_atoms_per_graph = scatter_sum(torch.ones_like(batch_ligand), batch_ligand, dim=0)
+                num_pairs_per_graph = num_atoms_per_graph ** 2
+                batch_bond_mg = torch.repeat_interleave(
+                    torch.arange(num_graphs, device=device), num_pairs_per_graph
+                )
+                ligand_bond_flat = torch.randint(0, 5, (batch_bond_mg.shape[0],), device=device)
+            else:
+                batch_bond_mg = ligand_bond_flat = None
 
             for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
@@ -1356,6 +1616,11 @@ class ScorePosNet3D(nn.Module):
                 sigma_per_atom = sigma_i[batch_ligand]
                 sigma_next_per_atom = sigma_next[batch_ligand]
 
+                # ── reconstruct bond_index/bond_type from flat bond state ──────────
+                smg_bond_index, smg_bond_type = None, None
+                if sample_bond and ligand_bond_flat is not None:
+                    smg_bond_index, smg_bond_type = _flat_bond_to_index_type(
+                        ligand_bond_flat, num_atoms_per_graph, batch_ligand.device)
                 with torch.no_grad():
                     preds = self(
                         protein_pos=protein_pos,
@@ -1365,6 +1630,8 @@ class ScorePosNet3D(nn.Module):
                         init_ligand_v=ligand_v,
                         batch_ligand=batch_ligand,
                         sigma=sigma_per_atom,
+                        init_ligand_bond_index=smg_bond_index,
+                        init_ligand_bond_type=smg_bond_type,
                     )
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
@@ -1411,9 +1678,10 @@ class ScorePosNet3D(nn.Module):
 
                 # ── Categorical guidance + discrete update (aligned order) ────────
                 if not pos_only:
-                    guided_pred_ligand_v = pred_ligand_v + combined_v_grad
-                    # print("v_grad.abs().mean()", combined_v_grad.abs().mean().item())
-                    # print("pred_v.abs().mean()", pred_ligand_v.abs().mean().item())
+                    if combined_v_grad is not None:
+                        guided_pred_ligand_v = pred_ligand_v + combined_v_grad
+                    else:
+                        guided_pred_ligand_v = pred_ligand_v
                     ligand_v, p_step, p_1_given_t = discrete_update(
                         ligand_v=ligand_v,
                         pred_ligand_v=guided_pred_ligand_v,
@@ -1425,6 +1693,22 @@ class ScorePosNet3D(nn.Module):
                     v0_pred_traj.append(torch.log(p_1_given_t.clamp(min=1e-10)).cpu())
                     vt_pred_traj.append(torch.log(p_step.clamp(min=1e-10)).cpu())
 
+                # ── Bond DFM update ───────────────────────────────────────────
+                if self.bond_loss and sample_bond and batch_bond_mg is not None and 'pred_bond_logits' in preds:
+                    pred_bond_logits_flat = torch.cat(
+                        [lg.reshape(-1, 5) for lg in preds['pred_bond_logits']], dim=0
+                    )
+                    ligand_bond_flat, _, _ = self.campbell_dfm_step_bond(
+                        ligand_bond_flat=ligand_bond_flat,
+                        pred_bond_logits_flat=pred_bond_logits_flat,
+                        sigma_i=sigma_i,
+                        sigma_next=sigma_next,
+                        batch_bond=batch_bond_mg,
+                        num_graphs=num_graphs,
+                        eps=eps,
+                    )
+                    bond_traj.append(ligand_bond_flat.clone().cpu())
+
                 ori_ligand_pos0 = pred_ligand_pos / self.rescale_factor + offset[batch_ligand]
                 ori_ligand_pos  = ligand_pos / self.rescale_factor + offset[batch_ligand]
                 pos0_traj.append(ori_ligand_pos0.clone().cpu())
@@ -1434,6 +1718,12 @@ class ScorePosNet3D(nn.Module):
             ligand_pos = pred_ligand_pos
             ligand_v   = F.one_hot(torch.argmax(pred_ligand_v, dim=-1), num_classes=S).float()
             ligand_pos = ligand_pos / self.rescale_factor + offset[batch_ligand]
+            if self.bond_loss and sample_bond and 'pred_bond_logits' in preds:
+                pred_bond_flat = torch.cat(
+                    [lg.reshape(-1, 5).argmax(dim=-1) for lg in preds['pred_bond_logits']], dim=0
+                )
+            else:
+                pred_bond_flat = None
             return {
                 'pos': ligand_pos,
                 'v': ligand_v,
@@ -1441,7 +1731,11 @@ class ScorePosNet3D(nn.Module):
                 'pos0_traj': pos0_traj,
                 'v_traj': v_traj,
                 'v0_traj': v0_pred_traj,
-                'vt_traj': vt_pred_traj
+                'vt_traj': vt_pred_traj,
+                'bond_traj': bond_traj,
+                'pred_bond': pred_bond_flat,
+                'batch_bond': batch_bond_mg,
+                'num_atoms_per_graph': num_atoms_per_graph if self.bond_loss and sample_bond else None,
             }
 
         if num_steps is None:

@@ -38,8 +38,10 @@ model:
   loss_pos_weight: 3.0
   loss_v_weight: 0.3
   bond_loss: true
+  bond_input: true
+  sample_bond: true
   loss_bond_weight: 0.1
-  loss_non_bond_weight: 0.02   # suppress no-bond class dominance
+  loss_non_bond_weight: 0.01   # suppress no-bond class dominance
   sample_time_method: symmetric  # ['importance', 'symmetric']
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM
