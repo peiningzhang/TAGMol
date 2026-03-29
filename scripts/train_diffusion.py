@@ -419,7 +419,8 @@ if __name__ == '__main__':
     # Training loop
     import time
     start_time = time.time()
-
+    yml_path = os.path.join(log_dir, 'training.yml')
+    os.system(f"cp {yml_path} {yml_path.replace('training.yml', 'sampling.yml')}")
     try:
         # best_loss and best_iter are initialized above (from checkpoint if resuming)
         for it in range(start_iter, config.train.max_iters + 1):

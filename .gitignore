@@ -46,6 +46,7 @@ logs_diffusion/
 *.log
 wandb/
 tensorboard_logs/
+nohup.out
 
 # Models
 pretrained_models/
@@ -78,3 +79,4 @@ Thumbs.db
 .venv/
 venv/
 env/
+tmp_eval/

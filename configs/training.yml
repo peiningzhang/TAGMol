@@ -13,15 +13,15 @@ model:
   beta_schedule: sigmoid
 
   # EDM coordinate parameters (VEDA)
-  sigma_data: 2
-  sigma_min: 0.0002
-  sigma_max: 160
+  sigma_data: 1
+  sigma_min: 0.001
+  sigma_max: 80
   rho: 2.0
 
   # EDM sigma sampling parameters (training only)
   # sigma ~ LogNormal(P_mean, P_std^2) as per EDM paper
-  edm_p_mean: -1.73   # mean in log-space, was -1.26
-  edm_p_std: 1.7     # std in log-space, was 1.41
+  edm_p_mean: -1.26   # mean in log-space
+  edm_p_std: 1.41     # std in log-space
 
 
   # Discrete FM attribute parameters (VEDA)
@@ -35,7 +35,7 @@ model:
   v_beta_schedule: cosine
   v_beta_s: 0.01
   num_diffusion_timesteps: 100
-  loss_pos_weight: 3.0
+  loss_pos_weight: 1.0
   loss_v_weight: 0.3
   bond_loss: true
   bond_input: true

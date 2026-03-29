@@ -96,7 +96,7 @@ def main():
         model.config.dfm_type = config.model.dfm_type
     if hasattr(config, "model") and hasattr(config.model, "veda_x_pred_mode"):
         model.config.veda_x_pred_mode = config.model.veda_x_pred_mode
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     logger.info(f"Loaded model from checkpoint: {args.checkpoint}")
 
