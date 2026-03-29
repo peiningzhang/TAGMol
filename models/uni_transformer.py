@@ -10,7 +10,7 @@ from models.common import GaussianSmearing, MLP, batch_hybrid_edge_connection, o
 
 class BaseX2HAttLayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, edge_feat_dim, r_feat_dim,
-                 act_fn='relu', norm=True, ew_net_type='r', out_fc=True):
+                 act_fn='relu', norm=True, ew_net_type='r', out_fc=True, bond_feat_dim=0):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -18,9 +18,13 @@ class BaseX2HAttLayer(nn.Module):
         self.n_heads = n_heads
         self.act_fn = act_fn
         self.edge_feat_dim = edge_feat_dim
+        self.bond_feat_dim = bond_feat_dim
         self.r_feat_dim = r_feat_dim
         self.ew_net_type = ew_net_type
         self.out_fc = out_fc
+
+        if self.bond_feat_dim > 0:
+            self.bond_bias_net = nn.Linear(self.bond_feat_dim, n_heads)
 
         # attention key func
         kv_input_dim = input_dim * 2 + edge_feat_dim + r_feat_dim
@@ -39,7 +43,8 @@ class BaseX2HAttLayer(nn.Module):
         if self.out_fc:
             self.node_output = MLP(2 * hidden_dim, hidden_dim, hidden_dim, norm=norm, act_fn=act_fn)
 
-    def forward(self, h, r_feat, edge_feat, edge_index, e_w=None):
+    def forward(self, h, r_feat, edge_feat, edge_index, e_w=None, 
+                bond_edge_index=None, bond_edge_feat=None):
         N = h.size(0)
         src, dst = edge_index
         hi, hj = h[dst], h[src]
@@ -70,8 +75,52 @@ class BaseX2HAttLayer(nn.Module):
         q = self.hq_func(h).view(-1, self.n_heads, self.output_dim // self.n_heads)
 
         # compute attention weights
-        alpha = scatter_softmax((q[dst] * k / np.sqrt(k.shape[-1])).sum(-1), dst, dim=0,
-                                dim_size=N)  # [num_edges, n_heads]
+        attn_scores = (q[dst] * k / np.sqrt(k.shape[-1])).sum(-1)  # [num_edges, n_heads]
+
+        # ── Bond Attention Bias (Edge-to-Attention) ───────────────────
+        if self.bond_feat_dim > 0 and bond_edge_index is not None and bond_edge_feat is not None:
+            # We need to map bond_edge_feat (sparse) to current edge_index
+            # Approach: Create a temporary dense-ish bias or use indexing
+            # Since edge_index and bond_edge_index might differ, we align them:
+            # 1. Compute bias for all bonds
+            bond_biases = self.bond_bias_net(bond_edge_feat) # (E_bond, n_heads)
+            
+            # 2. Use a dictionary-like approach for alignment (using pair keys)
+            # For efficiency in PyTorch, we can use a hash-based or sparse-dense mapping
+            # Simple approach: If it's the same edge, add bias
+            # Optimization: Pre-align indices before layers if possible.
+            # Here we use a naive but robust match (E_transformer, E_bond) if small, 
+            # or better: use scattering to a shared size.
+            
+            # Efficient indexing: 
+            # Key = src * N + dst
+            bond_keys = bond_edge_index[0] * N + bond_edge_index[1]
+            edge_keys = edge_index[0] * N + edge_index[1]
+            
+            # Map bond_biases to edge_index locations
+            # We use a tensor to store values for lookup
+            # WARNING: This might be memory intensive if N is huge.
+            # Alternatively, find intersections:
+            matches = torch.isin(edge_keys, bond_keys)
+            if matches.any():
+                # For matched edges, find which bond they correspond to
+                # This could be done with a temporary mapping-array
+                # (Using a more efficient scatter-based approach for production)
+                # For now: filter edge_keys that are in bond_keys
+                relevant_edge_keys = edge_keys[matches]
+                # Find the index in bond_keys for each relevant_edge_key
+                # Use bucketize or searchsorted if bond_keys is sorted
+                sorter = torch.argsort(bond_keys)
+                bond_indices = sorter[torch.searchsorted(bond_keys, relevant_edge_keys, sorter=sorter)]
+                # Sanity check: ensure keys actually match (since searchsorted returns insertion point)
+                valid_match = (bond_keys[bond_indices] == relevant_edge_keys)
+                if valid_match.any():
+                    final_matches = matches.clone()
+                    # Only the ones that passed key check
+                    # (Wait, matches was already based on isin, so it should be fine)
+                    attn_scores[matches] += bond_biases[bond_indices]
+
+        alpha = scatter_softmax(attn_scores, dst, dim=0, dim_size=N)  # [num_edges, n_heads]
 
         # perform attention-weighted message-passing
         m = alpha.unsqueeze(-1) * v  # (E, heads, H_per_head)
@@ -86,16 +135,20 @@ class BaseX2HAttLayer(nn.Module):
 
 class BaseH2XAttLayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, edge_feat_dim, r_feat_dim,
-                 act_fn='relu', norm=True, ew_net_type='r'):
+                 act_fn='relu', norm=True, ew_net_type='r', bond_feat_dim=0):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.n_heads = n_heads
         self.edge_feat_dim = edge_feat_dim
+        self.bond_feat_dim = bond_feat_dim
         self.r_feat_dim = r_feat_dim
         self.act_fn = act_fn
         self.ew_net_type = ew_net_type
+
+        if self.bond_feat_dim > 0:
+            self.bond_bias_net = nn.Linear(self.bond_feat_dim, n_heads)
 
         kv_input_dim = input_dim * 2 + edge_feat_dim + r_feat_dim
 
@@ -105,7 +158,8 @@ class BaseH2XAttLayer(nn.Module):
         if ew_net_type == 'r':
             self.ew_net = nn.Sequential(nn.Linear(r_feat_dim, 1), nn.Sigmoid())
 
-    def forward(self, h, rel_x, r_feat, edge_feat, edge_index, e_w=None):
+    def forward(self, h, rel_x, r_feat, edge_feat, edge_index, e_w=None,
+                bond_edge_index=None, bond_edge_feat=None):
         N = h.size(0)
         src, dst = edge_index
         hi, hj = h[dst], h[src]
@@ -132,7 +186,22 @@ class BaseH2XAttLayer(nn.Module):
         q = self.xq_func(h).view(-1, self.n_heads, self.output_dim // self.n_heads)
 
         # Compute attention weights
-        alpha = scatter_softmax((q[dst] * k / np.sqrt(k.shape[-1])).sum(-1), dst, dim=0, dim_size=N)  # (E, heads)
+        attn_scores = (q[dst] * k / np.sqrt(k.shape[-1])).sum(-1)  # (E, heads)
+
+        # ── Bond Attention Bias (Edge-to-Attention) ───────────────────
+        if self.bond_feat_dim > 0 and bond_edge_index is not None and bond_edge_feat is not None:
+            bond_biases = self.bond_bias_net(bond_edge_feat) # (E_bond, n_heads)
+            bond_keys = bond_edge_index[0] * N + bond_edge_index[1]
+            edge_keys = edge_index[0] * N + edge_index[1]
+            
+            matches = torch.isin(edge_keys, bond_keys)
+            if matches.any():
+                relevant_edge_keys = edge_keys[matches]
+                sorter = torch.argsort(bond_keys)
+                bond_indices = sorter[torch.searchsorted(bond_keys, relevant_edge_keys, sorter=sorter)]
+                attn_scores[matches] += bond_biases[bond_indices]
+
+        alpha = scatter_softmax(attn_scores, dst, dim=0, dim_size=N)  # (E, heads)
 
         # Perform attention-weighted message-passing
         m = alpha.unsqueeze(-1) * v  # (E, heads, 3)
@@ -143,11 +212,12 @@ class BaseH2XAttLayer(nn.Module):
 class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
     def __init__(self, hidden_dim, n_heads, num_r_gaussian, edge_feat_dim, act_fn='relu', norm=True,
                  num_x2h=1, num_h2x=1, r_min=0., r_max=10., num_node_types=8,
-                 ew_net_type='r', x2h_out_fc=True, sync_twoup=False):
+                 ew_net_type='r', x2h_out_fc=True, sync_twoup=False, bond_feat_dim=0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_heads = n_heads
         self.edge_feat_dim = edge_feat_dim
+        self.bond_feat_dim = bond_feat_dim
         self.num_r_gaussian = num_r_gaussian
         self.norm = norm
         self.act_fn = act_fn
@@ -167,7 +237,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 BaseX2HAttLayer(hidden_dim, hidden_dim, hidden_dim, n_heads, edge_feat_dim,
                                 r_feat_dim=num_r_gaussian * 4,
                                 act_fn=act_fn, norm=norm,
-                                ew_net_type=self.ew_net_type, out_fc=self.x2h_out_fc)
+                                ew_net_type=self.ew_net_type, out_fc=self.x2h_out_fc,
+                                bond_feat_dim=bond_feat_dim)
             )
         self.h2x_layers = nn.ModuleList()
         for i in range(self.num_h2x):
@@ -175,10 +246,12 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 BaseH2XAttLayer(hidden_dim, hidden_dim, hidden_dim, n_heads, edge_feat_dim,
                                 r_feat_dim=num_r_gaussian * 4,
                                 act_fn=act_fn, norm=norm,
-                                ew_net_type=self.ew_net_type)
+                                ew_net_type=self.ew_net_type,
+                                bond_feat_dim=bond_feat_dim)
             )
 
-    def forward(self, h, x, edge_attr, edge_index, mask_ligand, e_w=None, fix_x=False):
+    def forward(self, h, x, edge_attr, edge_index, mask_ligand, e_w=None, fix_x=False,
+                bond_edge_index=None, bond_edge_feat=None):
         src, dst = edge_index
         if self.edge_feat_dim > 0:
             edge_feat = edge_attr  # shape: [#edges_in_batch, #bond_types]
@@ -193,7 +266,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
         for i in range(self.num_x2h):
             dist_feat = self.distance_expansion(dist)
             dist_feat = outer_product(edge_attr, dist_feat)
-            h_out = self.x2h_layers[i](h_in, dist_feat, edge_feat, edge_index, e_w=e_w)
+            h_out = self.x2h_layers[i](h_in, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                       bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
             h_in = h_out
         x2h_out = h_in
 
@@ -201,7 +275,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
         for i in range(self.num_h2x):
             dist_feat = self.distance_expansion(dist)
             dist_feat = outer_product(edge_attr, dist_feat)
-            delta_x = self.h2x_layers[i](new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w)
+            delta_x = self.h2x_layers[i](new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                         bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
             if not fix_x:
                 x = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
             rel_x = x[dst] - x[src]
@@ -417,7 +492,8 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
     def __init__(self, num_blocks, num_layers, hidden_dim, n_heads=1, k=32,
                  num_r_gaussian=50, edge_feat_dim=0, num_node_types=8, act_fn='relu', norm=True,
                  cutoff_mode='radius', ew_net_type='r',
-                 num_init_x2h=1, num_init_h2x=0, num_x2h=1, num_h2x=1, r_max=10., x2h_out_fc=True, sync_twoup=False):
+                 num_init_x2h=1, num_init_h2x=0, num_x2h=1, num_h2x=1, r_max=10., x2h_out_fc=True, sync_twoup=False,
+                 bond_feat_dim=0):
         super().__init__()
         # Build the network
         self.num_blocks = num_blocks
@@ -426,6 +502,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         self.n_heads = n_heads
         self.num_r_gaussian = num_r_gaussian
         self.edge_feat_dim = edge_feat_dim
+        self.bond_feat_dim = bond_feat_dim
         self.act_fn = act_fn
         self.norm = norm
         self.num_node_types = num_node_types
@@ -460,6 +537,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
             self.hidden_dim, self.n_heads, self.num_r_gaussian, self.edge_feat_dim, act_fn=self.act_fn, norm=self.norm,
             num_x2h=self.num_init_x2h, num_h2x=self.num_init_h2x, r_max=self.r_max, num_node_types=self.num_node_types,
             ew_net_type=self.ew_net_type, x2h_out_fc=self.x2h_out_fc, sync_twoup=self.sync_twoup,
+            bond_feat_dim=self.bond_feat_dim,
         )
         return layer
 
@@ -472,6 +550,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
                 norm=self.norm,
                 num_x2h=self.num_x2h, num_h2x=self.num_h2x, r_max=self.r_max, num_node_types=self.num_node_types,
                 ew_net_type=self.ew_net_type, x2h_out_fc=self.x2h_out_fc, sync_twoup=self.sync_twoup,
+                bond_feat_dim=self.bond_feat_dim,
             )
             base_block.append(layer)
         return nn.ModuleList(base_block)
@@ -501,7 +580,8 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         edge_type = F.one_hot(edge_type, num_classes=4)
         return edge_type
 
-    def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False):
+    def forward(self, h, x, mask_ligand, batch, return_all=False, fix_x=False,
+                bond_edge_index=None, bond_edge_feat=None):
         ## coordinate x is predicted at every layer and the category v is predicted only at the end of all layers
 
         all_x = [x]
@@ -525,7 +605,8 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
                 e_w = None
 
             for l_idx, layer in enumerate(self.base_block):
-                h, x = layer(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x)
+                h, x = layer(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x,
+                             bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
             all_x.append(x)
             all_h.append(h)
 
@@ -557,7 +638,8 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
                     # print(f"Layer {l_idx}")
                     h, x = layer.forward_guided(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x, batch=batch, guide=guide)
                     continue
-                h, x = layer(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x)
+                h, x = layer(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x,
+                             bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
             all_x.append(x)
             all_h.append(h)
 

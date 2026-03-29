@@ -240,9 +240,13 @@ def _flat_bond_to_index_type(ligand_bond_flat, num_atoms_per_graph, device):
 # Model
 class ScorePosNet3D(nn.Module):
 
-    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim):
+    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim,
+                 bond_loss=False, sample_bond=False, use_bond_edge_feats=False):
         super().__init__()
         self.config = config
+        self.bond_loss = bond_loss
+        self.sample_bond = sample_bond
+        self.use_bond_edge_feats = use_bond_edge_feats
 
         # Diffusion type: veda (EDM+Discrete FM), edm_fm, or ddpm (legacy)
         self.diffusion_type = getattr(config, 'diffusion_type', 'ddpm')
@@ -377,7 +381,15 @@ class ScorePosNet3D(nn.Module):
             self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim, emb_dim)
 
         self.refine_net_type = config.model_type
-        self.refine_net = get_refine_net(self.refine_net_type, config)
+        if self.refine_net_type == 'uni_transformer':
+            # Add bond feature dimension to refine_net config before initialization
+            if self.use_bond_edge_feats:
+                config.model.refine_net.bond_feat_dim = 5
+            else:
+                config.model.refine_net.bond_feat_dim = 0
+            self.refine_net = get_refine_net(self.refine_net_type, config)
+        else:
+            self.refine_net = get_refine_net(self.refine_net_type, config)
         self.v_inference = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             ShiftedSoftplus(),
@@ -565,8 +577,31 @@ class ScorePosNet3D(nn.Module):
             batch_ligand=batch_ligand,
         )
 
+        # ── Bond Edge Features (Edge-to-Attention) ────────────────────
+        bond_edge_feat = None
+        global_bond_edge_index = None
+        if self.use_bond_edge_feats and init_ligand_bond_index is not None and init_ligand_bond_type is not None:
+            # 1. One-hot encoding
+            bond_edge_feat = F.one_hot(init_ligand_bond_type.long(), num_classes=5).float()
+            
+            # 2. IMPORTANT: Index Remapping
+            # ligand_h is placed into h_all via compose_context. We need global indices.
+            ligand_indices_in_all = mask_ligand.nonzero().squeeze(-1) # (N_ligand,)
+            global_bond_edge_index = ligand_indices_in_all[init_ligand_bond_index] # (2, E_bond)
+
         if guide is None:
-            outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x)
+            # Check for bond_edge_feat support
+            import inspect
+            sig = inspect.signature(self.refine_net.forward)
+            if 'bond_edge_feat' in sig.parameters:
+                outputs = self.refine_net(
+                    h_all, pos_all, mask_ligand, batch_all, 
+                    return_all=return_all, fix_x=fix_x,
+                    bond_edge_index=global_bond_edge_index,
+                    bond_edge_feat=bond_edge_feat
+                )
+            else:
+                outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x)
         else:
             outputs = self.refine_net.forward_guided(
                 h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x, 

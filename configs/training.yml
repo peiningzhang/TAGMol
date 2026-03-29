@@ -39,6 +39,7 @@ model:
   loss_v_weight: 0.3
   bond_loss: true
   bond_input: true
+  use_bond_edge_feats: false   # Adopt Edge-to-Attention mechanism (VEDA-style)
   sample_bond: true
   loss_bond_weight: 0.1
   loss_non_bond_weight: 0.01   # suppress no-bond class dominance
@@ -87,7 +88,7 @@ train:
   max_grad_norm: 8.0
   optimizer:
     type: adam
-    lr: 0.0001 #5.e-4
+    lr: 0.0003 #5.e-4
     weight_decay: 0
     beta1: 0.95
     beta2: 0.999
