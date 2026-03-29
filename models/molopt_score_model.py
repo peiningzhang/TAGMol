@@ -1261,6 +1261,19 @@ class ScorePosNet3D(nn.Module):
                         # 为每个被mask的原子采样新的类别
                         num_masked = mask_mask.sum().item()
                         ligand_v[mask_mask] = torch.distributions.Categorical(probs=self.prior_dist).sample((num_masked,)).to(ligand_v.device)
+
+                    # ── Bond noise injection ──────────────────────────────────
+                    if sample_bond and ligand_bond_flat is not None:
+                        mask_rate_bond_original = self.dfm_scheduler.mask_rate(sigma_i_original)
+                        mask_rate_bond_new = self.dfm_scheduler.mask_rate(sigma_i)
+                        mask_rate_bond_diff = ((mask_rate_bond_new - mask_rate_bond_original) / (1 - mask_rate_bond_original).clamp(min=1e-5)).clamp(min=0)
+                        
+                        # Expand to bond level mapping (one mask rate per graph, expanded to N^2 pairs)
+                        mask_rate_bond_diff_per_pair = mask_rate_bond_diff[batch_bond].squeeze(-1)
+                        bond_mask_mask = torch.rand(ligand_bond_flat.shape[0], device=device) < mask_rate_bond_diff_per_pair
+                        if bond_mask_mask.any():
+                            num_masked_bonds = bond_mask_mask.sum().item()
+                            ligand_bond_flat[bond_mask_mask] = torch.randint(0, 5, (num_masked_bonds,), device=device)
                 sigma_per_atom = sigma_i[batch_ligand]
                 sigma_next_per_atom = sigma_next[batch_ligand]
                 # ── reconstruct bond_index/bond_type from flat bond state ──────────
@@ -1438,6 +1451,19 @@ class ScorePosNet3D(nn.Module):
                         # 为每个被mask的原子采样新的类别
                         num_masked = mask_mask.sum().item()
                         ligand_v[mask_mask] = torch.distributions.Categorical(probs=self.prior_dist).sample((num_masked,)).to(ligand_v.device)
+
+                    # ── Bond noise injection ──────────────────────────────────
+                    if sample_bond and ligand_bond_flat is not None:
+                        mask_rate_bond_original = self.dfm_scheduler.mask_rate(sigma_i_original)
+                        mask_rate_bond_new = self.dfm_scheduler.mask_rate(sigma_i)
+                        mask_rate_bond_diff = ((mask_rate_bond_new - mask_rate_bond_original) / (1 - mask_rate_bond_original).clamp(min=1e-5)).clamp(min=0)
+                        
+                        # Expand to bond level mapping
+                        mask_rate_bond_diff_per_pair = mask_rate_bond_diff[batch_bond_g].squeeze(-1)
+                        bond_mask_mask = torch.rand(ligand_bond_flat.shape[0], device=device) < mask_rate_bond_diff_per_pair
+                        if bond_mask_mask.any():
+                            num_masked_bonds = bond_mask_mask.sum().item()
+                            ligand_bond_flat[bond_mask_mask] = torch.randint(0, 5, (num_masked_bonds,), device=device)
                 
                 sigma_per_atom = sigma_i[batch_ligand]
                 sigma_next_per_atom = sigma_next[batch_ligand]
@@ -1611,6 +1637,19 @@ class ScorePosNet3D(nn.Module):
                     if mask_mask.any():
                         num_masked = mask_mask.sum().item()
                         ligand_v[mask_mask] = torch.distributions.Categorical(probs=self.prior_dist).sample((num_masked,)).to(ligand_v.device)
+
+                    # ── Bond noise injection ──────────────────────────────────
+                    if sample_bond and ligand_bond_flat is not None:
+                        mask_rate_bond_original = self.dfm_scheduler.mask_rate(sigma_i_original)
+                        mask_rate_bond_new = self.dfm_scheduler.mask_rate(sigma_i)
+                        mask_rate_bond_diff = ((mask_rate_bond_new - mask_rate_bond_original) / (1 - mask_rate_bond_original).clamp(min=1e-5)).clamp(min=0)
+                        
+                        # Expand to bond level mapping
+                        mask_rate_bond_diff_per_pair = mask_rate_bond_diff[batch_bond_mg].squeeze(-1)
+                        bond_mask_mask = torch.rand(ligand_bond_flat.shape[0], device=device) < mask_rate_bond_diff_per_pair
+                        if bond_mask_mask.any():
+                            num_masked_bonds = bond_mask_mask.sum().item()
+                            ligand_bond_flat[bond_mask_mask] = torch.randint(0, 5, (num_masked_bonds,), device=device)
 
                 # ── per-atom sigma (same as sample_guided_diffusion) ──────────────
                 sigma_per_atom = sigma_i[batch_ligand]
