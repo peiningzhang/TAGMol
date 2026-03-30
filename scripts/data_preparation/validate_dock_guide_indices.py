@@ -54,7 +54,12 @@ def row_key(row):
 
 
 def describe_index(name, index):
-    lengths = Counter(len(row) for row in index)
+    def _row_len(row):
+        if isinstance(row, dict):
+            return len(row)
+        return len(row)
+
+    lengths = Counter(_row_len(row) for row in index)
     print(f"[{name}] rows: {len(index)}")
     print(f"[{name}] tuple lengths: {dict(sorted(lengths.items()))}")
     for i, row in enumerate(index[:3]):
@@ -63,7 +68,12 @@ def describe_index(name, index):
     prop_rows = 0
     prop_keys = Counter()
     for row in index:
-        if len(row) >= 1 and isinstance(row[-1], dict):
+        if isinstance(row, dict):
+            keys = {"vina_dock", "qed", "sa", "brenk_pass"} & set(row.keys())
+            if keys:
+                prop_rows += 1
+                prop_keys.update(keys)
+        elif len(row) >= 1 and isinstance(row[-1], dict):
             prop_rows += 1
             prop_keys.update(row[-1].keys())
     print(f"[{name}] rows with trailing prop dict: {prop_rows}")
@@ -77,6 +87,8 @@ def main():
     parser.add_argument("--guide_index", type=str, default=None)
     parser.add_argument("--base_lmdb", type=str, default=None)
     parser.add_argument("--guide_lmdb", type=str, default=None)
+    parser.add_argument("--max_records", type=int, default=5, help="How many LMDB records to inspect when falling back from index files")
+    parser.add_argument("--full_compare", action="store_true", help="Load and compare all records; slow on large LMDBs")
     args = parser.parse_args()
 
     base_index = load_index(args.base_index) if args.base_index else None
@@ -89,7 +101,7 @@ def main():
                 raise ValueError("Provide either --base_index or --base_lmdb")
             base_lmdb = infer_processed_lmdb(args.base_index)
         print(f"[base] index is not pickle; falling back to LMDB: {base_lmdb}")
-        base_index = load_lmdb_records(base_lmdb)
+        base_index = load_lmdb_records(base_lmdb, limit=None if args.full_compare else args.max_records)
 
     if guide_index is None:
         guide_lmdb = args.guide_lmdb
@@ -98,7 +110,7 @@ def main():
                 raise ValueError("Provide either --guide_index or --guide_lmdb")
             guide_lmdb = infer_processed_lmdb(args.guide_index)
         print(f"[guide] index is not pickle; falling back to LMDB: {guide_lmdb}")
-        guide_index = load_lmdb_records(guide_lmdb)
+        guide_index = load_lmdb_records(guide_lmdb, limit=None if args.full_compare else args.max_records)
 
     base_keys = [row_key(row) for row in base_index]
     guide_keys = [row_key(row) for row in guide_index]
@@ -115,6 +127,8 @@ def main():
     print(f"base-only pair keys: {len(base_set - guide_set)}")
     print(f"guide-only pair keys: {len(guide_set - base_set)}")
     print(f"exact same order: {base_keys == guide_keys}")
+    if not args.full_compare:
+        print(f"(sample-only check; use --full_compare for exhaustive comparison)")
 
     if base_index and guide_index:
         print(f"base first key: {base_keys[0] if base_keys else 'n/a'}")

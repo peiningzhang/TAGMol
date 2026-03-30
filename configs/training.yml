@@ -40,7 +40,7 @@ model:
   loss_v_weight: 0.3
   bond_loss: true
   bond_input: true
-  use_bond_edge_feats: true   # Adopt Edge-to-Attention mechanism (VEDA-style)
+  use_bond_edge_feats: false   # Adopt Edge-to-Attention mechanism (VEDA-style)
   sample_bond: true
   loss_bond_weight: 0.1
   loss_non_bond_weight: 0.01   # suppress no-bond class dominance
