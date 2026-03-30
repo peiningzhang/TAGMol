@@ -284,7 +284,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
 
         return x2h_out, x
 
-    def forward_guided(self, h, x, edge_attr, edge_index, mask_ligand, e_w=None, fix_x=False, batch=None, guide=None):
+    def forward_guided(self, h, x, edge_attr, edge_index, mask_ligand, e_w=None, fix_x=False, batch=None, guide=None,
+                       bond_edge_index=None, bond_edge_feat=None):
         src, dst = edge_index
         if self.edge_feat_dim > 0:
             edge_feat = edge_attr  # shape: [#edges_in_batch, #bond_types]
@@ -299,7 +300,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
         for i in range(self.num_x2h):
             dist_feat = self.distance_expansion(dist)
             dist_feat = outer_product(edge_attr, dist_feat)
-            h_out = self.x2h_layers[i](h_in, dist_feat, edge_feat, edge_index, e_w=e_w)
+            h_out = self.x2h_layers[i](h_in, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                       bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
             h_in = h_out
         x2h_out = h_in
 
@@ -341,7 +343,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 for i in range(self.num_h2x):
                     dist_feat = self.distance_expansion(dist_guide)
                     dist_feat = outer_product(edge_attr, dist_feat)
-                    delta_x = self.h2x_layers[i](new_h, rel_x_guide, dist_feat, edge_feat, edge_index, e_w=e_w)
+                    delta_x = self.h2x_layers[i](new_h, rel_x_guide, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                                   bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
                     if not fix_x:
                         x_guide = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                     rel_x_guide = x_guide[dst] - x_guide[src]
@@ -376,14 +379,16 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             for i in range(self.num_h2x):
                 dist_feat = self.distance_expansion(dist)
                 dist_feat = outer_product(edge_attr, dist_feat)
-                delta_x = self.h2x_layers[i](new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w)
+                delta_x = self.h2x_layers[i](new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                             bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
                 if not fix_x:
                     x = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                 rel_x = x[dst] - x[src]
                 dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
         return new_h, x
 
-    def forward_guided_h_x(self, h, x, edge_attr, edge_index, mask_ligand, e_w=None, fix_x=False, batch=None, guide=None):
+    def forward_guided_h_x(self, h, x, edge_attr, edge_index, mask_ligand, e_w=None, fix_x=False, batch=None, guide=None,
+                           bond_edge_index=None, bond_edge_feat=None):
         # TODO : reverify the code 
         src, dst = edge_index
         if self.edge_feat_dim > 0:
@@ -399,7 +404,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
         for i in range(self.num_x2h):
             dist_feat = self.distance_expansion(dist)
             dist_feat = outer_product(edge_attr, dist_feat)
-            h_out = self.x2h_layers[i](h_in, dist_feat, edge_feat, edge_index, e_w=e_w)
+            h_out = self.x2h_layers[i](h_in, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                       bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
             h_in = h_out
         x2h_out = h_in
 
@@ -442,7 +448,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 for i in range(self.num_h2x):
                     dist_feat = self.distance_expansion(dist_guide)
                     dist_feat = outer_product(edge_attr, dist_feat)
-                    delta_x = self.h2x_layers[i](new_h, rel_x_guide, dist_feat, edge_feat, edge_index, e_w=e_w)
+                    delta_x = self.h2x_layers[i](new_h, rel_x_guide, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                                   bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
                     if not fix_x:
                         x_guide = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                     rel_x_guide = x_guide[dst] - x_guide[src]
@@ -481,7 +488,8 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             for i in range(self.num_h2x):
                 dist_feat = self.distance_expansion(dist)
                 dist_feat = outer_product(edge_attr, dist_feat)
-                delta_x = self.h2x_layers[i](new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w)
+                delta_x = self.h2x_layers[i](new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w,
+                                             bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
                 if not fix_x:
                     x = x + delta_x * mask_ligand[:, None]  # only ligand positions will be updated
                 rel_x = x[dst] - x[src]
@@ -615,7 +623,8 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
             outputs.update({'all_x': all_x, 'all_h': all_h})
         return outputs
 
-    def forward_guided(self, h, x, mask_ligand, batch, return_all=False, fix_x=False, guide=None):
+    def forward_guided(self, h, x, mask_ligand, batch, return_all=False, fix_x=False, guide=None,
+                       bond_edge_index=None, bond_edge_feat=None):
         all_x = [x]
         all_h = [h]
 
@@ -636,7 +645,9 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
             for l_idx, layer in enumerate(self.base_block):
                 if guide is not None and l_idx >= len(self.base_block)-guide['gradient_n_layers']:
                     # print(f"Layer {l_idx}")
-                    h, x = layer.forward_guided(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x, batch=batch, guide=guide)
+                    h, x = layer.forward_guided(
+                        h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x, batch=batch, guide=guide,
+                        bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)
                     continue
                 h, x = layer(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x,
                              bond_edge_index=bond_edge_index, bond_edge_feat=bond_edge_feat)

@@ -1,3 +1,4 @@
+import inspect
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,7 +13,7 @@ from datasets.protein_ligand import KMAP
 from utils.misc import DFMTimeScheduler
 
 
-def get_refine_net(refine_net_type, config):
+def get_refine_net(refine_net_type, config, bond_feat_dim=0):
     if refine_net_type == 'uni_o2':
         refine_net = UniTransformerO2TwoUpdateGeneral(
             num_blocks=config.num_blocks,
@@ -31,7 +32,8 @@ def get_refine_net(refine_net_type, config):
             num_h2x=config.num_h2x,
             r_max=config.r_max,
             x2h_out_fc=config.x2h_out_fc,
-            sync_twoup=config.sync_twoup
+            sync_twoup=config.sync_twoup,
+            bond_feat_dim=bond_feat_dim,
         )
     elif refine_net_type == 'egnn':
         refine_net = EGNN(
@@ -240,13 +242,9 @@ def _flat_bond_to_index_type(ligand_bond_flat, num_atoms_per_graph, device):
 # Model
 class ScorePosNet3D(nn.Module):
 
-    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim,
-                 bond_loss=False, sample_bond=False, use_bond_edge_feats=False):
+    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim):
         super().__init__()
         self.config = config
-        self.bond_loss = bond_loss
-        self.sample_bond = sample_bond
-        self.use_bond_edge_feats = use_bond_edge_feats
 
         # Diffusion type: veda (EDM+Discrete FM), edm_fm, or ddpm (legacy)
         self.diffusion_type = getattr(config, 'diffusion_type', 'ddpm')
@@ -277,6 +275,7 @@ class ScorePosNet3D(nn.Module):
 
         self.sample_time_method = config.sample_time_method  # ['importance', 'symmetric']
         self.bond_input = getattr(config, 'bond_input', False)
+        self.use_bond_edge_feats = getattr(config, 'use_bond_edge_feats', False)
 
         if config.beta_schedule == 'cosine':
             alphas = cosine_beta_schedule(config.num_diffusion_timesteps, config.pos_beta_s) ** 2
@@ -400,15 +399,8 @@ class ScorePosNet3D(nn.Module):
             self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim + condition_feat_dim, emb_dim)
 
         self.refine_net_type = config.model_type
-        if self.refine_net_type == 'uni_transformer':
-            # Add bond feature dimension to refine_net config before initialization
-            if self.use_bond_edge_feats:
-                config.model.refine_net.bond_feat_dim = 5
-            else:
-                config.model.refine_net.bond_feat_dim = 0
-            self.refine_net = get_refine_net(self.refine_net_type, config)
-        else:
-            self.refine_net = get_refine_net(self.refine_net_type, config)
+        bond_feat_dim = 5 if self.use_bond_edge_feats else 0
+        self.refine_net = get_refine_net(self.refine_net_type, config, bond_feat_dim=bond_feat_dim)
         self.v_inference = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             ShiftedSoftplus(),
@@ -656,12 +648,10 @@ class ScorePosNet3D(nn.Module):
             global_bond_edge_index = ligand_indices_in_all[init_ligand_bond_index] # (2, E_bond)
 
         if guide is None:
-            # Check for bond_edge_feat support
-            import inspect
             sig = inspect.signature(self.refine_net.forward)
             if 'bond_edge_feat' in sig.parameters:
                 outputs = self.refine_net(
-                    h_all, pos_all, mask_ligand, batch_all, 
+                    h_all, pos_all, mask_ligand, batch_all,
                     return_all=return_all, fix_x=fix_x,
                     bond_edge_index=global_bond_edge_index,
                     bond_edge_feat=bond_edge_feat
@@ -669,10 +659,19 @@ class ScorePosNet3D(nn.Module):
             else:
                 outputs = self.refine_net(h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x)
         else:
-            outputs = self.refine_net.forward_guided(
-                h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x, 
-                guide=guide
-            )
+            sig_g = inspect.signature(self.refine_net.forward_guided)
+            if 'bond_edge_feat' in sig_g.parameters:
+                outputs = self.refine_net.forward_guided(
+                    h_all, pos_all, mask_ligand, batch_all,
+                    return_all=return_all, fix_x=fix_x, guide=guide,
+                    bond_edge_index=global_bond_edge_index,
+                    bond_edge_feat=bond_edge_feat,
+                )
+            else:
+                outputs = self.refine_net.forward_guided(
+                    h_all, pos_all, mask_ligand, batch_all, return_all=return_all, fix_x=fix_x,
+                    guide=guide
+                )
         final_pos, final_h = outputs['x'], outputs['h']
         ## final positions of ligand only is needed (protein positions are not changed or used)
         final_ligand_pos, final_ligand_h = final_pos[mask_ligand], final_h[mask_ligand]
