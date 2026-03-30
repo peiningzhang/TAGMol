@@ -367,6 +367,7 @@ class ScorePosNet3D(nn.Module):
 
         if self.use_condition:
             vocab_size = self.condition_bins + 1  # last index is reserved for null
+            self.condition_null_idx = self.condition_bins
             self.vina_bin_emb = nn.Embedding(vocab_size, self.condition_emb_dim)
             self.qed_bin_emb = nn.Embedding(vocab_size, self.condition_emb_dim)
             self.sa_bin_emb = nn.Embedding(vocab_size, self.condition_emb_dim)
@@ -434,35 +435,46 @@ class ScorePosNet3D(nn.Module):
                                  force_drop=False):
         """Build per-atom condition features from per-graph bins.
 
-        Default path returns zeros, so the original model behavior stays unchanged.
+        The reserved `null` index represents the unconditional branch.
         """
         if not self.use_condition:
             return None
 
         device = batch_ligand.device
-        num_atoms = batch_ligand.size(0)
-        zero_feat = torch.zeros(num_atoms, self.condition_emb_dim, device=device)
-        if force_drop or vina_bin is None or qed_bin is None or sa_bin is None:
-            return zero_feat
+        null_idx = self.condition_null_idx
 
-        vina_bin = vina_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins)
-        qed_bin = qed_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins)
-        sa_bin = sa_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins)
+        if vina_bin is None or qed_bin is None or sa_bin is None:
+            num_graphs = int(batch_ligand.max().item()) + 1
+            vina_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+            qed_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+            sa_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+        else:
+            vina_bin = vina_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+            qed_bin = qed_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+            sa_bin = sa_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
 
-        cond_graph_feat = torch.cat([
+        if force_drop:
+            vina_bin = torch.full_like(vina_bin, null_idx)
+            qed_bin = torch.full_like(qed_bin, null_idx)
+            sa_bin = torch.full_like(sa_bin, null_idx)
+
+        if self.training and self.condition_dropout > 0:
+            drop_mask = torch.rand(vina_bin.size(0), device=device) < self.condition_dropout
+            if drop_mask.any():
+                vina_bin = vina_bin.clone()
+                qed_bin = qed_bin.clone()
+                sa_bin = sa_bin.clone()
+                vina_bin[drop_mask] = null_idx
+                qed_bin[drop_mask] = null_idx
+                sa_bin[drop_mask] = null_idx
+
+        cond_input = torch.cat([
             self.vina_bin_emb(vina_bin),
             self.qed_bin_emb(qed_bin),
             self.sa_bin_emb(sa_bin),
         ], dim=-1)
-
-        if self.training and self.condition_dropout > 0:
-            drop_mask = torch.rand(cond_graph_feat.size(0), device=device) < self.condition_dropout
-            if drop_mask.any():
-                cond_graph_feat = cond_graph_feat.clone()
-                cond_graph_feat[drop_mask] = 0.0
-
-        cond_graph_feat = self.condition_proj(cond_graph_feat)
-        if cond_graph_feat.size(0) == num_atoms:
+        cond_graph_feat = self.condition_proj(cond_input)
+        if cond_graph_feat.size(0) == batch_ligand.size(0):
             return cond_graph_feat
         return cond_graph_feat[batch_ligand]
 
