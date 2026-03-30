@@ -141,6 +141,9 @@ if __name__ == '__main__':
         ligand_featurizer,
         trans.FeaturizeLigandBond(),
     ]
+    condition_bins_path = getattr(config.data.transform, 'condition_bins_path', None)
+    if condition_bins_path:
+        transform_list.append(trans.FeaturizeConditionBins(spec_path=condition_bins_path))
     if config.data.transform.random_rot:
         transform_list.append(trans.RandomRotation())
     transform = Compose(transform_list)

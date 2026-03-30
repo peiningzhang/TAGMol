@@ -269,6 +269,11 @@ class ScorePosNet3D(nn.Module):
         self.bond_loss = getattr(config, 'bond_loss', False)
         self.loss_bond_weight = getattr(config, 'loss_bond_weight', 1.0)
         self.loss_non_bond_weight = getattr(config, 'loss_non_bond_weight', 0.1)
+        # Optional condition path: disabled by default to preserve old behavior
+        self.use_condition = getattr(config, 'use_condition', False)
+        self.condition_dropout = getattr(config, 'condition_dropout', 0.0) if self.use_condition else 0.0
+        self.condition_bins = getattr(config, 'condition_bins', 5)
+        self.condition_emb_dim = getattr(config, 'condition_emb_dim', 8)
 
         self.sample_time_method = config.sample_time_method  # ['importance', 'symmetric']
         self.bond_input = getattr(config, 'bond_input', False)
@@ -361,12 +366,26 @@ class ScorePosNet3D(nn.Module):
         # center pos
         self.center_pos_mode = config.center_pos_mode  # ['none', 'protein']
 
+        if self.use_condition:
+            vocab_size = self.condition_bins + 1  # last index is reserved for null
+            self.vina_bin_emb = nn.Embedding(vocab_size, self.condition_emb_dim)
+            self.qed_bin_emb = nn.Embedding(vocab_size, self.condition_emb_dim)
+            self.sa_bin_emb = nn.Embedding(vocab_size, self.condition_emb_dim)
+            self.condition_proj = nn.Sequential(
+                nn.Linear(self.condition_emb_dim * 3, self.condition_emb_dim),
+                ShiftedSoftplus(),
+                nn.Linear(self.condition_emb_dim, self.condition_emb_dim),
+            )
+            condition_feat_dim = self.condition_emb_dim
+        else:
+            condition_feat_dim = 0
+
         # time embedding
         self.time_emb_dim = config.time_emb_dim
         self.time_emb_mode = config.time_emb_mode  # ['simple', 'sin']
         if self.time_emb_dim > 0:
             if self.time_emb_mode == 'simple':
-                self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim + 1, emb_dim)
+                self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim + 1 + condition_feat_dim, emb_dim)
             elif self.time_emb_mode == 'sin':
                 self.time_emb = nn.Sequential(
                     SinusoidalPosEmb(self.time_emb_dim),
@@ -374,11 +393,11 @@ class ScorePosNet3D(nn.Module):
                     nn.GELU(),
                     nn.Linear(self.time_emb_dim * 4, self.time_emb_dim)
                 )
-                self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim + self.time_emb_dim, emb_dim)
+                self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim + self.time_emb_dim + condition_feat_dim, emb_dim)
             else:
                 raise NotImplementedError
         else:
-            self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim, emb_dim)
+            self.ligand_atom_emb = nn.Linear(ligand_atom_feature_dim + condition_feat_dim, emb_dim)
 
         self.refine_net_type = config.model_type
         if self.refine_net_type == 'uni_transformer':
@@ -418,6 +437,42 @@ class ScorePosNet3D(nn.Module):
         c_in = 1 / (sigma ** 2 + sigma_data ** 2) ** 0.5
         c_noise = torch.log(sigma.clamp(min=1e-12)) / 4
         return c_skip, c_out, c_in, c_noise
+
+    def _build_condition_feature(self, batch_ligand, vina_bin=None, qed_bin=None, sa_bin=None,
+                                 force_drop=False):
+        """Build per-atom condition features from per-graph bins.
+
+        Default path returns zeros, so the original model behavior stays unchanged.
+        """
+        if not self.use_condition:
+            return None
+
+        device = batch_ligand.device
+        num_atoms = batch_ligand.size(0)
+        zero_feat = torch.zeros(num_atoms, self.condition_emb_dim, device=device)
+        if force_drop or vina_bin is None or qed_bin is None or sa_bin is None:
+            return zero_feat
+
+        vina_bin = vina_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins)
+        qed_bin = qed_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins)
+        sa_bin = sa_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins)
+
+        cond_graph_feat = torch.cat([
+            self.vina_bin_emb(vina_bin),
+            self.qed_bin_emb(qed_bin),
+            self.sa_bin_emb(sa_bin),
+        ], dim=-1)
+
+        if self.training and self.condition_dropout > 0:
+            drop_mask = torch.rand(cond_graph_feat.size(0), device=device) < self.condition_dropout
+            if drop_mask.any():
+                cond_graph_feat = cond_graph_feat.clone()
+                cond_graph_feat[drop_mask] = 0.0
+
+        cond_graph_feat = self.condition_proj(cond_graph_feat)
+        if cond_graph_feat.size(0) == num_atoms:
+            return cond_graph_feat
+        return cond_graph_feat[batch_ligand]
 
     def _sample_discrete_dfm_noise(self, v_1, sigma, batch, num_classes):
         """Generalized DFM noising: sample v_t from P(v_t|v_1) = (1-kappa_t) * OneHot(v_1) + kappa_t / S.
@@ -490,7 +545,8 @@ class ScorePosNet3D(nn.Module):
 
     def forward(self, protein_pos, protein_v, batch_protein, init_ligand_pos, init_ligand_v, batch_ligand,
                 sigma=None, return_all=False, fix_x=False, guide=None,
-                init_ligand_bond_index=None, init_ligand_bond_type=None):
+                init_ligand_bond_index=None, init_ligand_bond_type=None,
+                vina_bin=None, qed_bin=None, sa_bin=None, condition_force_drop=False):
         """_summary_
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -539,6 +595,16 @@ class ScorePosNet3D(nn.Module):
                 raise NotImplementedError
         else:
             input_ligand_feat = init_ligand_v
+
+        if self.use_condition:
+            condition_feat = self._build_condition_feature(
+                batch_ligand,
+                vina_bin=vina_bin,
+                qed_bin=qed_bin,
+                sa_bin=sa_bin,
+                force_drop=condition_force_drop,
+            )
+            input_ligand_feat = torch.cat([input_ligand_feat, condition_feat], dim=-1)
 
         ## convert one-hot features into the embedding space
         h_protein = self.protein_atom_emb(protein_v)
@@ -769,7 +835,8 @@ class ScorePosNet3D(nn.Module):
 
     def get_diffusion_loss(
             self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand,
-            time_step=None, ligand_bond_index=None, ligand_bond_type=None, ligand_bond_type_batch=None
+            time_step=None, ligand_bond_index=None, ligand_bond_type=None, ligand_bond_type_batch=None,
+            vina_bin=None, qed_bin=None, sa_bin=None
     ):
         num_graphs = batch_protein.max().item() + 1
         protein_pos, ligand_pos, _ = center_pos_rescale(
@@ -850,6 +917,9 @@ class ScorePosNet3D(nn.Module):
                 sigma=sigma_per_atom,
                 init_ligand_bond_index=noisy_bond_index,
                 init_ligand_bond_type=noisy_bond_type,
+                vina_bin=vina_bin,
+                qed_bin=qed_bin,
+                sa_bin=sa_bin,
             )
             pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
@@ -1201,7 +1271,8 @@ class ScorePosNet3D(nn.Module):
     @torch.no_grad()
     def sample_diffusion(self, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
-                         num_steps=None, center_pos_mode=None, pos_only=False):
+                         num_steps=None, center_pos_mode=None, pos_only=False,
+                         cfg_scale=1.0, vina_bin=None, qed_bin=None, sa_bin=None):
         """ Denoise the init_ligand_pos and init_ligand_v.
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -1316,17 +1387,37 @@ class ScorePosNet3D(nn.Module):
                 if sample_bond and ligand_bond_flat is not None:
                     sd_bond_index, sd_bond_type = _flat_bond_to_index_type(
                         ligand_bond_flat, num_atoms_per_graph, batch_ligand.device)
-                preds = self(
-                    protein_pos=protein_pos,
-                    protein_v=protein_v,
-                    batch_protein=batch_protein,
-                    init_ligand_pos=ligand_pos,
-                    init_ligand_v=ligand_v,
-                    batch_ligand=batch_ligand,
-                    sigma=sigma_per_atom,
-                    init_ligand_bond_index=sd_bond_index,
-                    init_ligand_bond_type=sd_bond_type,
-                )
+                def _run_forward(condition_force_drop=False):
+                    return self(
+                        protein_pos=protein_pos,
+                        protein_v=protein_v,
+                        batch_protein=batch_protein,
+                        init_ligand_pos=ligand_pos,
+                        init_ligand_v=ligand_v,
+                        batch_ligand=batch_ligand,
+                        sigma=sigma_per_atom,
+                        init_ligand_bond_index=sd_bond_index,
+                        init_ligand_bond_type=sd_bond_type,
+                        vina_bin=vina_bin,
+                        qed_bin=qed_bin,
+                        sa_bin=sa_bin,
+                        condition_force_drop=condition_force_drop,
+                    )
+
+                if self.use_condition and cfg_scale != 1.0 and (vina_bin is not None or qed_bin is not None or sa_bin is not None):
+                    preds_cond = _run_forward(condition_force_drop=False)
+                    preds_uncond = _run_forward(condition_force_drop=True)
+                    preds = {
+                        'pred_ligand_pos': preds_uncond['pred_ligand_pos'] + cfg_scale * (preds_cond['pred_ligand_pos'] - preds_uncond['pred_ligand_pos']),
+                        'pred_ligand_v': preds_uncond['pred_ligand_v'] + cfg_scale * (preds_cond['pred_ligand_v'] - preds_uncond['pred_ligand_v']),
+                    }
+                    if self.bond_loss and 'pred_bond_logits' in preds_cond:
+                        preds['pred_bond_logits'] = [
+                            u + cfg_scale * (c - u)
+                            for u, c in zip(preds_uncond['pred_bond_logits'], preds_cond['pred_bond_logits'])
+                        ]
+                else:
+                    preds = _run_forward(condition_force_drop=False)
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
                 # Euler step for pos: d_i = (pos_i - D_theta) / sigma_i, pos_next = pos_i + dt * d_i

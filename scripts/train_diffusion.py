@@ -166,6 +166,9 @@ if __name__ == '__main__':
         ligand_featurizer,
         trans.FeaturizeLigandBond(),
     ]
+    condition_bins_path = getattr(config.data.transform, 'condition_bins_path', None)
+    if condition_bins_path:
+        transform_list.append(trans.FeaturizeConditionBins(spec_path=condition_bins_path))
     if config.data.transform.random_rot:
         transform_list.append(trans.RandomRotation())
     transform = Compose(transform_list)
@@ -288,6 +291,9 @@ if __name__ == '__main__':
                 ligand_bond_index=batch.ligand_bond_index,
                 ligand_bond_type=batch.ligand_bond_type,
                 ligand_bond_type_batch=batch.ligand_bond_type_batch,
+                vina_bin=getattr(batch, 'vina_bin', None),
+                qed_bin=getattr(batch, 'qed_bin', None),
+                sa_bin=getattr(batch, 'sa_bin', None),
             )
             loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
             loss_bond = results.get('loss_bond', torch.tensor(0.))
@@ -358,6 +364,9 @@ if __name__ == '__main__':
                         ligand_bond_index=batch.ligand_bond_index,
                         ligand_bond_type=batch.ligand_bond_type,
                         ligand_bond_type_batch=batch.ligand_bond_type_batch,
+                        vina_bin=getattr(batch, 'vina_bin', None),
+                        qed_bin=getattr(batch, 'qed_bin', None),
+                        sa_bin=getattr(batch, 'sa_bin', None),
                     )
                     loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
                     loss_bond = results.get('loss_bond', torch.tensor(0.))

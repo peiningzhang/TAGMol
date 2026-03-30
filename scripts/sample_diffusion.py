@@ -30,7 +30,7 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 
 def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cuda:0',
                             num_steps=None, pos_only=False, center_pos_mode='protein',
-                            sample_num_atoms='prior'):
+                            sample_num_atoms='prior', cfg_scale=1.0):
     all_pred_pos, all_pred_v = [], []
     all_pred_pos_traj, all_pred_pos0_traj, all_pred_v_traj = [], [], []
     all_pred_v0_traj, all_pred_vt_traj = [], []
@@ -79,7 +79,11 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
                 batch_ligand=batch_ligand,
                 num_steps=num_steps,
                 pos_only=pos_only,
-                center_pos_mode=center_pos_mode
+                center_pos_mode=center_pos_mode,
+                cfg_scale=cfg_scale,
+                vina_bin=getattr(batch, 'vina_bin', None),
+                qed_bin=getattr(batch, 'qed_bin', None),
+                sa_bin=getattr(batch, 'sa_bin', None),
             )
             ligand_pos, ligand_v, ligand_pos_traj, ligand_v_traj = r['pos'], r['v'], r['pos_traj'], r['v_traj']
             ligand_v0_traj, ligand_vt_traj, ligand_pos0_traj = r['v0_traj'], r['vt_traj'], r['pos0_traj']
@@ -133,6 +137,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--result_path', type=str, default='./outputs')
     parser.add_argument('--checkpoint', type=str, default=None, help='Override checkpoint path')
+    parser.add_argument('--cfg_scale', type=float, default=1.0, help='Condition guidance scale; 1.0 disables CFG')
     args = parser.parse_args()
 
     logger = misc.get_logger('sampling')
@@ -156,6 +161,14 @@ if __name__ == '__main__':
         ligand_featurizer,
         trans.FeaturizeLigandBond(),
     ])
+    condition_bins_path = getattr(ckpt['config'].data.transform, 'condition_bins_path', None)
+    if condition_bins_path:
+        transform = Compose([
+            protein_featurizer,
+            ligand_featurizer,
+            trans.FeaturizeLigandBond(),
+            trans.FeaturizeConditionBins(spec_path=condition_bins_path),
+        ])
 
     # Load dataset
     dataset, subsets = get_dataset(
@@ -181,7 +194,8 @@ if __name__ == '__main__':
         num_steps=config.sample.num_steps,
         pos_only=config.sample.pos_only,
         center_pos_mode=config.sample.center_pos_mode,
-        sample_num_atoms=config.sample.sample_num_atoms
+        sample_num_atoms=config.sample.sample_num_atoms,
+        cfg_scale=getattr(config.sample, 'cfg_scale', args.cfg_scale)
     )
     result = {
         'data': data,

@@ -1,9 +1,11 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import yaml
 
 from datasets.pl_data import ProteinLigandData
 from utils import data as utils_data
+from utils.condition_bins import bucketize_oriented_value, orient_value, resolve_property_field, to_float_scalar
 
 AROMATIC_FEAT_MAP_IDX = utils_data.ATOM_FAMILIES_ID['Aromatic']
 
@@ -180,4 +182,38 @@ class RandomRotation(object):
         Q = torch.from_numpy(Q.astype(np.float32))
         data.ligand_pos = data.ligand_pos @ Q
         data.protein_pos = data.protein_pos @ Q
+        return data
+
+
+class FeaturizeConditionBins(object):
+
+    def __init__(self, spec_path=None, spec=None):
+        super().__init__()
+        if spec is None:
+            if spec_path is None:
+                raise ValueError("Either spec_path or spec must be provided")
+            with open(spec_path, "r") as f:
+                spec = yaml.safe_load(f)
+        self.spec = spec
+
+    @property
+    def feature_dim(self):
+        return 3
+
+    def __call__(self, data: ProteinLigandData):
+        bins = {}
+        for prop in ("vina", "qed", "sa"):
+            entry = self.spec["properties"][prop]
+            field = entry["field"]
+            if not hasattr(data, field) and field not in data:
+                raise KeyError(
+                    f"Condition field '{field}' is missing from sample {getattr(data, 'id', 'unknown')}"
+                )
+            raw_value = to_float_scalar(data[field])
+            oriented_value = orient_value(prop, raw_value)
+            bin_idx = bucketize_oriented_value(oriented_value, entry["edges"])
+            bins[prop] = bin_idx
+            data[f"{prop}_bin"] = torch.tensor(bin_idx, dtype=torch.long)
+
+        data.cond_bin = torch.tensor([[bins["vina"], bins["qed"], bins["sa"]]], dtype=torch.long)
         return data
