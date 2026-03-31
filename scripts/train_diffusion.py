@@ -428,8 +428,10 @@ if __name__ == '__main__':
     # Training loop
     import time
     start_time = time.time()
-    yml_path = os.path.join(log_dir, 'training.yml')
-    os.system(f"cp {yml_path} {yml_path.replace('training.yml', 'sampling.yml')}")
+    if not args.trial:
+        yml_path = os.path.join(log_dir, 'training.yml')
+        if os.path.exists(yml_path):
+            os.system(f"cp {yml_path} {yml_path.replace('training.yml', 'sampling.yml')}")
     try:
         # best_loss and best_iter are initialized above (from checkpoint if resuming)
         for it in range(start_iter, config.train.max_iters + 1):
@@ -451,63 +453,82 @@ if __name__ == '__main__':
                 logger.info(f'[Checkpoint] Saved last checkpoint to: {last_ckpt_path} (iter {it})')
             # Quick eval: sample + full metrics every quick_eval_freq steps, log to wandb
             if (it % quick_eval_freq == 0) or (it == config.train.max_iters):
-                tmp_dir = tempfile.mkdtemp(prefix='train_quick_eval_', dir=log_dir)
-                try:
-                    model.eval()
-                    n_pocket = min(quick_eval_num_proteins, len(val_set))
-                    for data_id in range(n_pocket):
-                        data = val_set[data_id]
-                        with torch.no_grad():
-                            pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, pred_pos0_traj, time_list = sample_diffusion_ligand(
-                                model, data, quick_eval_num_ligands,
-                                batch_size=min(quick_eval_num_ligands, 10),
-                                device=args.device,
-                                num_steps=config.model.num_diffusion_timesteps,
-                                pos_only=False,
-                                center_pos_mode=config.model.center_pos_mode,
-                                sample_num_atoms='prior',
-                            )
-                        result = {
-                            'data': data,
-                            'pred_ligand_pos': pred_pos,
-                            'pred_ligand_v': pred_v,
-                            'pred_ligand_pos_traj': pred_pos_traj,
-                            'pred_ligand_v_traj': pred_v_traj,
-                            'pred_ligand_pos0_traj': pred_pos0_traj,
-                            'pred_ligand_v0_traj': pred_v0_traj,
-                            'time': time_list,
-                        }
-                        torch.save(result, os.path.join(tmp_dir, f'result_{data_id}.pt'))
-                    quick_eval_docking = getattr(config.train, 'quick_eval_docking_mode', 'vina_score')
-                    test_protein_root = config.data.test_path
-                    metrics, _ = run_evaluation(
-                        tmp_dir,
-                        eval_step=-1,
-                        eval_num_examples=n_pocket,
-                        docking_mode=quick_eval_docking,
-                        protein_root=test_protein_root,
-                        atom_enc_mode=config.data.transform.ligand_atom_mode,
-                        verbose=False,
-                        save=False,
-                    )
-                    eval_log = {f'eval/{k}': v for k, v in metrics.items() if v is not None}
-                    if eval_log and use_wandb:
-                        wandb.log(eval_log)
-                    log_parts = ['%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None]
-                    logger.info('[QuickEval] Iter %d | %s' % (it, ' '.join(log_parts)))
-                    # Vina Score / Vina Min (Mean, Median)
-                    vs_mean, vs_med = metrics.get('Vina_score_mean'), metrics.get('Vina_score_med')
-                    vm_mean, vm_med = metrics.get('Vina_min_mean'), metrics.get('Vina_min_med')
-                    if vs_mean is not None and vs_med is not None:
-                        logger.info('[QuickEval] Vina Score:  Mean: %.3f  Median: %.3f' % (vs_mean, vs_med))
-                    if vm_mean is not None and vm_med is not None:
-                        logger.info('[QuickEval] Vina Min  :  Mean: %.3f  Median: %.3f' % (vm_mean, vm_med))
-                except Exception as e:
-                    print(e)
-                finally:
-                    model.train()
-                    if os.path.isdir(tmp_dir):
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                eval_scales = [1.0, 3.0] if getattr(config.model, 'use_condition', False) else [1.0]
+                for cfg_scale in eval_scales:
+                    tmp_dir = tempfile.mkdtemp(prefix=f'train_quick_eval_cfg{cfg_scale}_', dir=log_dir)
+                    try:
+                        model.eval()
+                        n_pocket = min(quick_eval_num_proteins, len(val_set))
+                        for data_id in range(n_pocket):
+                            data = val_set[data_id]
+                            
+                            # For de novo sampling, force condition bins to the highest tier
+                            if getattr(config.model, 'use_condition', False):
+                                num_bins = getattr(config.model, 'condition_bins', 5)
+                                best_bin = num_bins - 1
+                                data.vina_bin = torch.tensor(best_bin, dtype=torch.long)
+                                data.qed_bin = torch.tensor(best_bin, dtype=torch.long)
+                                data.sa_bin = torch.tensor(best_bin, dtype=torch.long)
+                                
+                            with torch.no_grad():
+                                pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, pred_pos0_traj, time_list = sample_diffusion_ligand(
+                                    model, data, quick_eval_num_ligands,
+                                    batch_size=min(quick_eval_num_ligands, 10),
+                                    device=args.device,
+                                    num_steps=config.model.num_diffusion_timesteps,
+                                    pos_only=False,
+                                    center_pos_mode=config.model.center_pos_mode,
+                                    sample_num_atoms='prior',
+                                    cfg_scale=cfg_scale,
+                                )
+                            result = {
+                                'data': data,
+                                'pred_ligand_pos': pred_pos,
+                                'pred_ligand_v': pred_v,
+                                'pred_ligand_pos_traj': pred_pos_traj,
+                                'pred_ligand_v_traj': pred_v_traj,
+                                'pred_ligand_pos0_traj': pred_pos0_traj,
+                                'pred_ligand_v0_traj': pred_v0_traj,
+                                'time': time_list,
+                            }
+                            torch.save(result, os.path.join(tmp_dir, f'result_{data_id}.pt'))
+                        
+                        quick_eval_docking = getattr(config.train, 'quick_eval_docking_mode', 'vina_score')
+                        test_protein_root = config.data.test_path
+                        metrics, _ = run_evaluation(
+                            tmp_dir,
+                            eval_step=-1,
+                            eval_num_examples=n_pocket,
+                            docking_mode=quick_eval_docking,
+                            protein_root=test_protein_root,
+                            atom_enc_mode=config.data.transform.ligand_atom_mode,
+                            verbose=False,
+                            save=False,
+                        )
+                        
+                        prefix = 'eval' if cfg_scale == 1.0 else f'eval_cfg{int(cfg_scale)}'
+                        eval_log = {f'{prefix}/{k}': v for k, v in metrics.items() if v is not None}
+                        if eval_log and use_wandb:
+                            wandb.log(eval_log)
+                        
+                        log_parts = ['%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None]
+                        scale_str = f' (cfg={cfg_scale})' if cfg_scale != 1.0 else ''
+                        logger.info(f'[QuickEval] Iter {it}{scale_str} | {" ".join(log_parts)}')
+                        
+                        # Vina Score / Vina Min (Mean, Median)
+                        vs_mean, vs_med = metrics.get('Vina_score_mean'), metrics.get('Vina_score_med')
+                        vm_mean, vm_med = metrics.get('Vina_min_mean'), metrics.get('Vina_min_med')
+                        if vs_mean is not None and vs_med is not None:
+                            logger.info(f'[QuickEval]{scale_str} Vina Score:  Mean: {vs_mean:.3f}  Median: {vs_med:.3f}')
+                        if vm_mean is not None and vm_med is not None:
+                            logger.info(f'[QuickEval]{scale_str} Vina Min  :  Mean: {vm_mean:.3f}  Median: {vm_med:.3f}')
+                            
+                    except Exception as e:
+                        logger.error(f'Error during QuickEval (cfg={cfg_scale}): {e}')
+                    finally:
+                        model.train()
+                        if os.path.isdir(tmp_dir):
+                            shutil.rmtree(tmp_dir, ignore_errors=True)
             if it % config.train.val_freq == 0 or it == config.train.max_iters:
                 val_loss = validate(it)
                 if best_loss is None or val_loss < best_loss:
