@@ -45,6 +45,13 @@ if __name__ == '__main__':
     parser.add_argument('config', type=str)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--logdir', type=str, default='./logs_diffusion')
+    parser.add_argument(
+        '--reuse_logdir',
+        type=str,
+        default=None,
+        help='Use this existing directory as log_dir (checkpoints, log.txt, tensorboard). '
+        'Use when resuming so new ckpts append to the same run folder.',
+    )
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--train_report_iter', type=int, default=200)
     # Trial mode options
@@ -90,12 +97,18 @@ if __name__ == '__main__':
         ckpt_dir = None
         log_dir = None
     else:
-        log_dir = misc.get_new_log_dir(args.logdir, prefix=config_name, tag=args.tag)
+        if args.reuse_logdir:
+            log_dir = os.path.abspath(os.path.expanduser(args.reuse_logdir))
+            os.makedirs(log_dir, exist_ok=True)
+        else:
+            log_dir = misc.get_new_log_dir(args.logdir, prefix=config_name, tag=args.tag)
         ckpt_dir = os.path.join(log_dir, 'checkpoints')
         os.makedirs(ckpt_dir, exist_ok=True)
         vis_dir = os.path.join(log_dir, 'vis')
         os.makedirs(vis_dir, exist_ok=True)
         logger = misc.get_logger('train', log_dir)
+        if args.reuse_logdir:
+            logger.info(f'Reusing log directory: {log_dir}')
         writer = torch.utils.tensorboard.SummaryWriter(log_dir)
 
     # Initialize wandb (skip if --no_wandb or --trial)
@@ -155,8 +168,14 @@ if __name__ == '__main__':
     logger.info(config)
 
     if not args.trial:
-        shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
-        shutil.copytree('./models', os.path.join(log_dir, 'models'))
+        config_dst = os.path.join(log_dir, os.path.basename(args.config))
+        try:
+            shutil.copyfile(args.config, config_dst)
+        except shutil.SameFileError:
+            pass  # config already lives in log_dir (e.g. resume with training.yml in reuse_logdir)
+        models_snap = os.path.join(log_dir, 'models')
+        if not os.path.isdir(models_snap):
+            shutil.copytree('./models', models_snap)
 
     # Transforms
     protein_featurizer = trans.FeaturizeProteinAtom()

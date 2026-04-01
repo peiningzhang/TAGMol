@@ -8,8 +8,8 @@ do
     echo "Running quick_evaluate with time_scheduler: $SCHED"
     echo "=========================================================="
     python scripts/quick_evaluate.py \
-        --config logs_diffusion/training_2026_03_24__15_57_54/sampling.yml \
-        --checkpoint logs_diffusion/training_2026_03_24__15_57_54/checkpoints/last.pt \
+        --config logs_diffusion/training_2026_03_30__01_06_07/sampling.yml \
+        --checkpoint logs_diffusion/training_2026_03_30__01_06_07/checkpoints/last.pt \
         --num_proteins 100 \
         --num_ligands_per_protein 10 \
         --docking_mode vina_score \
