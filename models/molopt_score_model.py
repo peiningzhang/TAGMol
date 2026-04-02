@@ -1283,7 +1283,7 @@ class ScorePosNet3D(nn.Module):
     def sample_diffusion(self, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False,
-                         cfg_scale=1.0, vina_bin=None, qed_bin=None, sa_bin=None):
+                         cfg_scale=0.0, vina_bin=None, qed_bin=None, sa_bin=None):
         """ Denoise the init_ligand_pos and init_ligand_v.
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -1415,7 +1415,7 @@ class ScorePosNet3D(nn.Module):
                         condition_force_drop=condition_force_drop,
                     )
 
-                if self.use_condition and cfg_scale != 1.0 and (vina_bin is not None or qed_bin is not None or sa_bin is not None):
+                if self.use_condition and cfg_scale != 0.0 and (vina_bin is not None or qed_bin is not None or sa_bin is not None):
                     preds_cond = _run_forward(condition_force_drop=False)
                     preds_uncond = _run_forward(condition_force_drop=True)
                     preds = {
@@ -1428,7 +1428,7 @@ class ScorePosNet3D(nn.Module):
                             for u, c in zip(preds_uncond['pred_bond_logits'], preds_cond['pred_bond_logits'])
                         ]
                 else:
-                    preds = _run_forward(condition_force_drop=False)
+                    preds = _run_forward(condition_force_drop=True)
                 pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
                 # Euler step for pos: d_i = (pos_i - D_theta) / sigma_i, pos_next = pos_i + dt * d_i

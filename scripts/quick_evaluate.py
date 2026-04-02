@@ -1,7 +1,11 @@
 import argparse
+import glob
+import json
 import os
-import tempfile
 import subprocess
+import sys
+import tempfile
+from collections import defaultdict
 from datetime import datetime
 
 import torch
@@ -16,6 +20,197 @@ from models.molopt_guide_model import DockGuideNet3D
 from scripts.sample_diffusion import sample_diffusion_ligand
 # Multi‑guide diffusion function
 from scripts.sample_multi_guided_diffusion import sample_guided_diffusion_ligand as sample_multi_guided_diffusion
+from scripts.evaluate_diffusion import report_evaluation_to_logger, run_evaluation
+
+
+def export_metrics_to_grouped_sdf(pt_file, out_dir, logger):
+    """Write one multi-molecule SDF per pocket from evaluate_diffusion metrics_*.pt."""
+    try:
+        from rdkit import Chem
+    except ImportError as e:
+        logger.error("RDKit is required for --export_grouped_sdf: %s", e)
+        return False
+    if not os.path.isfile(pt_file):
+        logger.error("Metrics file not found (run evaluation with --save first): %s", pt_file)
+        return False
+    os.makedirs(out_dir, exist_ok=True)
+    data = torch.load(pt_file)
+    results = data.get("all_results", [])
+    grouped_mols = defaultdict(list)
+    for i, res in enumerate(results):
+        mol = res.get("mol")
+        if mol is None:
+            continue
+        target_name = res.get("ligand_filename", "target_%d" % i)
+        if isinstance(target_name, str):
+            if target_name.startswith("LIGAND_"):
+                target_name = target_name.replace("LIGAND_", "")
+            target_name_base = target_name.split(".")[0].replace("/", "_")
+        else:
+            target_name_base = "target_%d" % i
+        if "chem_results" in res and isinstance(res["chem_results"], dict):
+            cr = res["chem_results"]
+            if "qed" in cr:
+                mol.SetProp("QED", str(cr["qed"]))
+            if "sa" in cr:
+                mol.SetProp("SA", str(cr["sa"]))
+        if res.get("vina"):
+            try:
+                val = res["vina"].get("score_only", [{}])[0].get("affinity", "")
+                mol.SetProp("Vina", str(val))
+            except (TypeError, IndexError, KeyError):
+                pass
+        grouped_mols[target_name_base].append(mol)
+    n_files, n_mols = 0, 0
+    for target_name, mols in grouped_mols.items():
+        sdf_path = os.path.join(out_dir, "%s_generated.sdf" % target_name)
+        w = Chem.SDWriter(sdf_path)
+        for m in mols:
+            w.write(m)
+            n_mols += 1
+        w.close()
+        n_files += 1
+    logger.info(
+        "Exported %d molecules into %d grouped SDF files under %s",
+        n_mols,
+        n_files,
+        out_dir,
+    )
+    return n_files > 0
+
+
+def run_genbench3d_suite(
+    sdf_group_dir,
+    gb3d_dir,
+    test_set_dir,
+    genbench_python,
+    logger,
+    do_conf_analysis=False,
+    no_vina=False,
+):
+    """Run GenBench3D sb_benchmark_mols.py on each *_generated.sdf and write aggregated JSON.
+
+    With do_conf_analysis=True, passes --do_conf_analysis so GenBench3D also computes Validity3D
+    (KDE vs reference geometry), TFD-based Uniqueness3D/Diversity3D/Novelty3D, and MMFF strain energy.
+    Use -s ligboundconf (default) and ligboundconf_path in GenBench default.yaml — no CSD license needed.
+
+    With no_vina=True, passes --no_vina (requires a patched sb_benchmark_mols.py that implements this flag).
+    Steric clash and distance-to-native-centroid still use the pocket; Vina / relative Vina metrics are omitted.
+    """
+    # subprocess uses cwd=gb3d_dir; all paths passed to sb_benchmark_mols.py must be absolute.
+    sdf_group_dir = os.path.abspath(sdf_group_dir)
+    gb3d_dir = os.path.abspath(gb3d_dir)
+    test_set_dir = os.path.abspath(test_set_dir)
+    output_dir = os.path.join(sdf_group_dir, "genbench_results")
+    os.makedirs(output_dir, exist_ok=True)
+    sdf_files = glob.glob(os.path.join(sdf_group_dir, "*_generated.sdf"))
+    if not sdf_files:
+        logger.error("No *_generated.sdf under %s; use --export_grouped_sdf or point --sdf_grouped_dir to existing SDFs.", sdf_group_dir)
+        return False
+    all_native = glob.glob(os.path.join(test_set_dir, "*", "*.sdf"))
+    ligand_map = {}
+    for np_path in all_native:
+        lig_base = os.path.basename(np_path).replace(".sdf", "")
+        pocket_dir_name = os.path.basename(os.path.dirname(np_path))
+        ligand_map["%s_%s" % (pocket_dir_name, lig_base)] = np_path
+    failed = []
+    success = 0
+    sb_script = os.path.join(gb3d_dir, "sb_benchmark_mols.py")
+    cfg_yaml = os.path.join(gb3d_dir, "config", "default.yaml")
+    if not os.path.isfile(sb_script) or not os.path.isfile(cfg_yaml):
+        logger.error("GenBench3D not found at gb3d_dir=%s (missing sb_benchmark_mols.py or config/default.yaml)", gb3d_dir)
+        return False
+    for sdf in sdf_files:
+        basename = os.path.basename(sdf).replace("_generated.sdf", "")
+        native_ligand = ligand_map.get(basename)
+        if not native_ligand:
+            logger.warning("Native ligand not found in test_set for %s", basename)
+            failed.append(basename)
+            continue
+        pocket_dir = os.path.dirname(native_ligand)
+        proteins = [f for f in os.listdir(pocket_dir) if f.endswith("_rec.pdb")]
+        if not proteins:
+            logger.warning("Protein not found in %s", pocket_dir)
+            failed.append(basename)
+            continue
+        protein_pdb = os.path.abspath(os.path.join(pocket_dir, proteins[0]))
+        sdf_abs = os.path.abspath(sdf)
+        native_abs = os.path.abspath(native_ligand)
+        out_json = os.path.abspath(os.path.join(output_dir, "results_%s.json" % basename))
+        cmd = [
+            genbench_python,
+            sb_script,
+            "-c",
+            cfg_yaml,
+            "-i",
+            sdf_abs,
+            "-p",
+            protein_pdb,
+            "-n",
+            native_abs,
+            "-o",
+            out_json,
+            "-s",
+            "ligboundconf",
+        ]
+        if do_conf_analysis:
+            cmd.append("--do_conf_analysis")
+        if no_vina:
+            cmd.append("--no_vina")
+        logger.info("GenBench3D: %s", basename)
+        try:
+            subprocess.run(cmd, cwd=gb3d_dir, check=True)
+            success += 1
+        except subprocess.CalledProcessError as e:
+            logger.warning("GenBench3D failed for %s: %s", basename, e)
+            failed.append(basename)
+    logger.info("GenBench3D finished: success=%d failed=%d; results in %s", success, len(failed), output_dir)
+    merged = []
+    for jf in sorted(glob.glob(os.path.join(output_dir, "results_*.json"))):
+        try:
+            with open(jf, "r") as f:
+                res = json.load(f)
+            res["pocket"] = os.path.basename(jf)
+            merged.append(res)
+        except (json.JSONDecodeError, OSError):
+            pass
+    if merged:
+        agg = os.path.join(output_dir, "all_results_aggregated.json")
+        with open(agg, "w") as outf:
+            json.dump(merged, outf)
+        logger.info("Wrote aggregated GenBench3D JSON: %s", agg)
+    return success > 0 or len(merged) > 0
+
+
+def print_genbench_console_report(aggregated_json_path, logger):
+    """Same table as: python get_genbench_report.py <all_results_aggregated.json>"""
+    aggregated_json_path = os.path.abspath(aggregated_json_path)
+    if not os.path.isfile(aggregated_json_path):
+        logger.warning("GenBench console report skipped (missing %s)", aggregated_json_path)
+        return
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    try:
+        import get_genbench_report as gbr
+    except ImportError as e:
+        logger.warning("Could not import get_genbench_report for console summary: %s", e)
+        return
+    try:
+        pockets = gbr.load_pocket_dicts(aggregated_json_path)
+        if not pockets:
+            logger.warning("GenBench console report: empty aggregated JSON")
+            return
+        all_metrics, n_pockets = gbr.aggregate_metrics(pockets)
+        logger.info(
+            "GenBench3D console summary (equivalent to: python get_genbench_report.py %s)",
+            aggregated_json_path,
+        )
+        gbr.print_report(all_metrics, n_pockets)
+        gbr.log_genbench_two_line_metrics(logger, all_metrics, n_pockets)
+    except Exception as e:
+        logger.warning("GenBench console report failed: %s", e)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -25,10 +220,22 @@ def main():
     parser.add_argument('--num_proteins', type=int, default=5, help='Number of protein pockets to evaluate (from test split).')
     parser.add_argument('--num_ligands_per_protein', type=int, default=10, help='Number of ligands to sample per protein.')
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size for sampling.')
+    parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale for conditioned models; 0.0 = unconditional (no CFG blend), >0 enables CFG.')
     parser.add_argument('--tmp_root', type=str, default='./tmp_eval', help='Root directory to create temporary evaluation folders.')
     parser.add_argument('--eval_step', type=int, default=-1, help='Which diffusion step to evaluate (passed to evaluate_diffusion.py).')
     parser.add_argument('--docking_mode', type=str, default='none', choices=['qvina', 'vina_score', 'vina_dock', 'none'], help='Docking mode passed to evaluate_diffusion.py.')
-    parser.add_argument('--protein_root', type=str, default='./data/test_set', help='Protein root for docking (dir containing PDB files).')
+    parser.add_argument(
+        '--protein_root',
+        type=str,
+        default=None,
+        help='Root for docking in evaluate_diffusion (PDB/ligand paths). Default: config.data.test_path if set, else ./data/test_set.',
+    )
+    parser.add_argument(
+        '--test_set_dir',
+        type=str,
+        default=None,
+        help='Root for GenBench3D native ligand lookup (pocket subdirs with .sdf). Default: --test_set_dir if passed, else config.data.test_path, else --protein_root.',
+    )
     parser.add_argument('--exhaustiveness', type=int, default=16, help='Docking exhaustiveness passed to evaluate_diffusion.py.')
     # Guidance arguments (single or multiple)
     parser.add_argument('--guide_checkpoint', type=str, default=None, help='Path to a single guidance model checkpoint.')
@@ -39,11 +246,70 @@ def main():
     parser.add_argument('--time_scheduler', type=str, default=None, help='Time scheduler to use, overriding config.')
     parser.add_argument('--num_steps', type=int, default=None, help='Number of diffusion steps for sampling, overriding config.')
     parser.add_argument('--sample_config', type=str, default=None, help='Path to a yaml that defines guide_models (checkpoint, weight, gradient_scale_cord, gradient_scale_categ). Overrides --guide_checkpoints and related args.')
+    # Optional: grouped SDF export + GenBench3D (off by default)
+    parser.add_argument(
+        '--export_grouped_sdf',
+        action='store_true',
+        help='After evaluation, export metrics to grouped *_generated.sdf (requires RDKit; enables saving metrics).',
+    )
+    parser.add_argument(
+        '--sdf_grouped_dir',
+        type=str,
+        default=None,
+        help='Directory for grouped SDFs. Default: <tmp_dir>/sdfs_grouped when exporting or running GenBench from this run.',
+    )
+    parser.add_argument(
+        '--run_genbench',
+        action='store_true',
+        help='Run GenBench3D on *_generated.sdf under --sdf_grouped_dir (export in the same run or use an existing directory).',
+    )
+    parser.add_argument(
+        '--gb3d_dir',
+        type=str,
+        default=None,
+        help='GenBench3D repository root (contains sb_benchmark_mols.py). Required with --run_genbench.',
+    )
+    parser.add_argument(
+        '--genbench_python',
+        type=str,
+        default='python',
+        help='Python executable for GenBench3D subprocess (use conda env python if needed).',
+    )
+    parser.add_argument(
+        '--no_genbench_console_report',
+        action='store_true',
+        help='With --run_genbench, do not print get_genbench_report.py-style summary after aggregation.',
+    )
+    parser.add_argument(
+        '--genbench_do_conf_analysis',
+        action='store_true',
+        help='With --run_genbench, pass --do_conf_analysis to GenBench3D (Validity3D, TFD metrics, MMFF strain). Slower.',
+    )
+    parser.add_argument(
+        '--genbench_no_vina',
+        action='store_true',
+        help='With --run_genbench, pass --no_vina to GenBench3D (skip Vina/minimized Vina; needs patched sb_benchmark_mols.py).',
+    )
     args = parser.parse_args()
+
+    if args.run_genbench and not args.gb3d_dir:
+        parser.error('--run_genbench requires --gb3d_dir')
 
     # Load global config (data split, seeds, etc.)
     config = misc.load_config(args.config)
     misc.seed_all(config.train.seed)
+
+    # Resolve paths: config.data.test_path (e.g. ./data/test_set) is the canonical benchmark pocket tree.
+    cfg_test_path = getattr(config.data, 'test_path', None)
+    protein_root = args.protein_root if args.protein_root is not None else (cfg_test_path or './data/test_set')
+    protein_root = os.path.abspath(protein_root)
+
+    def resolve_genbench_test_set_dir():
+        if args.test_set_dir is not None:
+            return os.path.abspath(args.test_set_dir)
+        if cfg_test_path:
+            return os.path.abspath(cfg_test_path)
+        return protein_root
 
     # Temporary directory for results
     os.makedirs(args.tmp_root, exist_ok=True)
@@ -52,6 +318,7 @@ def main():
 
     logger = misc.get_logger("quick_eval", log_dir=None)
     logger.info(f"Temporary evaluation directory: {tmp_dir}")
+    logger.info("Docking protein_root (evaluate_diffusion): %s", protein_root)
 
     # Load the score (generation) model checkpoint
     ckpt = torch.load(args.checkpoint, map_location=args.device)
@@ -99,6 +366,12 @@ def main():
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     logger.info(f"Loaded model from checkpoint: {args.checkpoint}")
+    use_condition = getattr(ckpt_cfg.model, "use_condition", False)
+    if use_condition:
+        logger.info(
+            f"Model uses conditioning (use_condition=True); sampling with cfg_scale={args.cfg_scale} "
+            f"and target bins set to top tier (de novo, same as train quick eval)."
+        )
 
     # ---------------------------------------------------------------------
     # Load guidance models (single or multiple)
@@ -154,6 +427,13 @@ def main():
         data = test_set[data_id]
         logger.info(f"Sampling for protein index {data_id}...")
 
+        if use_condition:
+            num_bins = getattr(ckpt_cfg.model, "condition_bins", 5)
+            best_bin = num_bins - 1
+            data.vina_bin = torch.tensor(best_bin, dtype=torch.long)
+            data.qed_bin = torch.tensor(best_bin, dtype=torch.long)
+            data.sa_bin = torch.tensor(best_bin, dtype=torch.long)
+
         if guide_models is not None:
             # Multi‑guide diffusion
             (
@@ -199,6 +479,7 @@ def main():
                 pos_only=False,
                 center_pos_mode=ckpt_cfg.model.center_pos_mode,
                 sample_num_atoms='prior',
+                cfg_scale=args.cfg_scale,
             )
 
         result = {
@@ -223,22 +504,58 @@ def main():
     # ---------------------------------------------------------------------
     # Run evaluation script on the generated samples
     # ---------------------------------------------------------------------
-    logger.info('Running evaluation on generated samples...')
-    eval_cmd = [
-        "python",
-        "scripts/evaluate_diffusion.py",
-        tmp_dir,
-        '--eval_step', str(args.eval_step),
-        '--eval_num_examples', str(num_proteins),
-        '--docking_mode', args.docking_mode,
-        '--save', 'False',
-        '--one_line',
-    ]
-    if args.docking_mode != 'none':
-        eval_cmd += ['--verbose', 'True']
-        eval_cmd += ['--protein_root', args.protein_root, '--exhaustiveness', str(args.exhaustiveness)]
-    logger.info(f"Eval command: {' '.join(eval_cmd)}")
-    subprocess.run(eval_cmd, check=False)
+    sdf_grouped_dir = args.sdf_grouped_dir
+    if sdf_grouped_dir is None and (args.export_grouped_sdf or args.run_genbench):
+        sdf_grouped_dir = os.path.join(tmp_dir, "sdfs_grouped")
+    save_metrics = bool(args.export_grouped_sdf)
+    tagmol_names_tsv, tagmol_vals_tsv = None, None
+
+    logger.info("Running evaluation on generated samples (in-process evaluate_diffusion)...")
+    eval_results_dir = os.path.join(tmp_dir, "eval_results")
+    os.makedirs(eval_results_dir, exist_ok=True)
+    eval_logger = misc.get_logger("evaluate", log_dir=eval_results_dir)
+    out, results = run_evaluation(
+        sample_path=tmp_dir,
+        eval_step=args.eval_step,
+        eval_num_examples=num_proteins,
+        docking_mode=args.docking_mode,
+        protein_root=protein_root,
+        verbose=args.docking_mode != "none",
+        save=save_metrics,
+        exhaustiveness=args.exhaustiveness,
+        logger=eval_logger,
+    )
+    tagmol_names_tsv, tagmol_vals_tsv = report_evaluation_to_logger(
+        out, results, args.docking_mode, eval_logger, one_line=True
+    )
+
+    if args.export_grouped_sdf:
+        metrics_pt = os.path.join(tmp_dir, "eval_results", "metrics_%d.pt" % args.eval_step)
+        out_sdf = sdf_grouped_dir or os.path.join(tmp_dir, "sdfs_grouped")
+        export_metrics_to_grouped_sdf(metrics_pt, out_sdf, logger)
+
+    if args.run_genbench:
+        gdir = sdf_grouped_dir or os.path.join(tmp_dir, "sdfs_grouped")
+        genbench_test_set = resolve_genbench_test_set_dir()
+        logger.info("GenBench3D native ligand root: %s", genbench_test_set)
+        run_genbench3d_suite(
+            gdir,
+            os.path.abspath(args.gb3d_dir),
+            genbench_test_set,
+            args.genbench_python,
+            logger,
+            do_conf_analysis=args.genbench_do_conf_analysis,
+            no_vina=args.genbench_no_vina,
+        )
+        if not args.no_genbench_console_report:
+            agg_json = os.path.join(os.path.abspath(gdir), "genbench_results", "all_results_aggregated.json")
+            print_genbench_console_report(agg_json, logger)
+
+    if tagmol_names_tsv is not None and tagmol_vals_tsv is not None:
+        logger.info("=" * 60)
+        logger.info("TAGMol metrics (repeat, tab-separated)")
+        logger.info("METRICS_ONE_LINE_HEAD\t%s", tagmol_names_tsv)
+        logger.info("METRICS_ONE_LINE_VAL\t%s", tagmol_vals_tsv)
 
     logger.info("Quick evaluation finished.")
 

@@ -19,16 +19,14 @@ model:
 
   # EDM coordinate parameters (VEDA)
   sigma_data: 1
-  sigma_min: 0.001
+  sigma_min: 0.0003
   sigma_max: 80
   rho: 2.0
 
   # EDM sigma sampling parameters (training only)
   # sigma ~ LogNormal(P_mean, P_std^2) as per EDM paper
-  edm_p_mean: -1.26   # mean in log-space
-  edm_p_std: 1.41     # std in log-space
-
-
+  edm_p_mean: -1.86   # mean in log-space, was -1.26
+  edm_p_std: 1.56     # std in log-space, was 1.41
   # Discrete FM attribute parameters (VEDA)
   discrete_prior: uniform  # ['uniform', 'marginal']
   # DFM (Exact Discrete Flow Matching) parameters
@@ -40,12 +38,12 @@ model:
   v_beta_schedule: cosine
   v_beta_s: 0.01
   num_diffusion_timesteps: 100
-  loss_pos_weight: 1.0
+  loss_pos_weight: 3.0
   loss_v_weight: 0.3
-  bond_loss: true
-  bond_input: true
+  bond_loss: false
+  bond_input: false
   use_bond_edge_feats: false   # Adopt Edge-to-Attention mechanism (VEDA-style)
-  sample_bond: true
+  sample_bond: false
   loss_bond_weight: 0.1
   loss_non_bond_weight: 0.01   # suppress no-bond class dominance
   sample_time_method: symmetric  # ['importance', 'symmetric']
@@ -97,7 +95,7 @@ train:
   max_grad_norm: 8.0
   optimizer:
     type: adam
-    lr: 0.0003 #5.e-4
+    lr: 0.0001 #5.e-4
     weight_decay: 0
     beta1: 0.95
     beta2: 0.999

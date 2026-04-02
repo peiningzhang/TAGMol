@@ -30,7 +30,7 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 
 def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cuda:0',
                             num_steps=None, pos_only=False, center_pos_mode='protein',
-                            sample_num_atoms='prior', cfg_scale=1.0):
+                            sample_num_atoms='prior', cfg_scale=0.0):
     all_pred_pos, all_pred_v = [], []
     all_pred_pos_traj, all_pred_pos0_traj, all_pred_v_traj = [], [], []
     all_pred_v0_traj, all_pred_vt_traj = [], []
@@ -137,7 +137,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--result_path', type=str, default='./outputs')
     parser.add_argument('--checkpoint', type=str, default=None, help='Override checkpoint path')
-    parser.add_argument('--cfg_scale', type=float, default=1.0, help='Condition guidance scale; 1.0 disables CFG')
+    parser.add_argument('--cfg_scale', type=float, default=0.0, help='Condition guidance scale; 0.0 = unconditional (no CFG), >0 enables CFG.')
     args = parser.parse_args()
 
     logger = misc.get_logger('sampling')

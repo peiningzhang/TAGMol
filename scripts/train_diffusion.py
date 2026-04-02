@@ -472,7 +472,7 @@ if __name__ == '__main__':
                 logger.info(f'[Checkpoint] Saved last checkpoint to: {last_ckpt_path} (iter {it})')
             # Quick eval: sample + full metrics every quick_eval_freq steps, log to wandb
             if (it % quick_eval_freq == 0) or (it == config.train.max_iters):
-                eval_scales = [1.0, 3.0] if getattr(config.model, 'use_condition', False) else [1.0]
+                eval_scales = [0.0, 3.0] if getattr(config.model, 'use_condition', False) else [0.0]
                 for cfg_scale in eval_scales:
                     tmp_dir = tempfile.mkdtemp(prefix=f'train_quick_eval_cfg{cfg_scale}_', dir=log_dir)
                     try:
@@ -525,13 +525,13 @@ if __name__ == '__main__':
                             save=False,
                         )
                         
-                        prefix = 'eval' if cfg_scale == 1.0 else f'eval_cfg{int(cfg_scale)}'
+                        prefix = 'eval' if cfg_scale == 0.0 else f'eval_cfg{int(cfg_scale)}'
                         eval_log = {f'{prefix}/{k}': v for k, v in metrics.items() if v is not None}
                         if eval_log and use_wandb:
                             wandb.log(eval_log)
                         
                         log_parts = ['%s=%.4f' % (k, v) for k, v in list(metrics.items())[:8] if v is not None]
-                        scale_str = f' (cfg={cfg_scale})' if cfg_scale != 1.0 else ''
+                        scale_str = f' (cfg={cfg_scale})' if cfg_scale != 0.0 else ''
                         logger.info(f'[QuickEval] Iter {it}{scale_str} | {" ".join(log_parts)}')
                         
                         # Vina Score / Vina Min (Mean, Median)

@@ -81,9 +81,9 @@ model:
 采样入口支持 `cfg_scale`。
 
 默认值：
-- `cfg_scale = 1.0`，等价于不启用 CFG
+- `cfg_scale = 0.0`，等价于不启用 CFG（仅 unconditional / null 条件分支）
 
-启用 CFG 时：
+启用 CFG 时（`cfg_scale > 0`）：
 - 模型会做一次 conditional forward
 - 再做一次 unconditional forward
 - 最终按 `uncond + scale * (cond - uncond)` 合成

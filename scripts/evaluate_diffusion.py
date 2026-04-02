@@ -139,7 +139,14 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
             all_bond_dist += bond_dist
             success_pair_dist += pair_dist
             success_atom_types += Counter(pred_atom_type)
-            results.append({'mol': mol, 'smiles': smiles, 'chem_results': chem_results, 'vina': vina_results})
+            results.append({
+                'mol': mol,
+                'smiles': smiles,
+                'chem_results': chem_results,
+                'vina': vina_results,
+                'ligand_filename': ligand_filename,
+                'protein_filename': protein_filename,
+            })
 
     if docking_mode != 'none' and n_eval_success == 0 and first_docking_error[0] is not None:
         r_name, err = first_docking_error[0]
@@ -216,6 +223,104 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
     return out, results
 
 
+def metrics_one_line_tsv_parts(out, results, docking_mode):
+    """Tab-separated field strings matching CLI --one_line (uses '\\t ' between columns)."""
+    bond_js_keys = [k for k in out if k.startswith('JSD_') and k not in ('JSD_CC_2A', 'JSD_All_12A')]
+    pair_js_keys = [k for k in ('JSD_CC_2A', 'JSD_All_12A') if k in out]
+    c_bond_length_dict = {k: out[k] for k in bond_js_keys}
+    success_js_metrics = {k: out[k] for k in pair_js_keys}
+
+    def _fmt(v):
+        if v is None:
+            return 'N/A'
+        if isinstance(v, float):
+            return '%.4f' % v
+        return str(v)
+
+    names, values = [], []
+    for name in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']:
+        names.append(name)
+        values.append(_fmt(out[name]))
+    for k in sorted(c_bond_length_dict.keys()):
+        names.append(k)
+        values.append(_fmt(out.get(k)))
+    for k in sorted(success_js_metrics.keys()):
+        names.append(k)
+        values.append(_fmt(out.get(k)))
+    names.append('atom_type_js')
+    values.append(_fmt(out.get('atom_type_js')))
+    names.extend(['n_recon', 'n_complete', 'n_eval'])
+    values.extend([str(out['n_recon']), str(out['n_complete']), str(out['n_eval'])])
+    names.extend(['QED_mean', 'QED_med', 'SA_mean', 'SA_med'])
+    values.extend([_fmt(out['QED_mean']), _fmt(out['QED_med']), _fmt(out['SA_mean']), _fmt(out['SA_med'])])
+    if docking_mode == 'qvina' and results:
+        vina = [r['vina'][0]['affinity'] for r in results]
+        names.extend(['Vina_mean', 'Vina_med'])
+        values.extend([_fmt(np.mean(vina)), _fmt(np.median(vina))])
+    elif docking_mode in ['vina_dock', 'vina_score'] and results:
+        vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
+        vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
+        names.extend(['Vina_score_mean', 'Vina_score_med', 'Vina_min_mean', 'Vina_min_med'])
+        values.extend(
+            [
+                _fmt(np.mean(vina_score_only)),
+                _fmt(np.median(vina_score_only)),
+                _fmt(np.mean(vina_min)),
+                _fmt(np.median(vina_min)),
+            ]
+        )
+    sep = '\t '
+    return sep.join(names), sep.join(values)
+
+
+def report_evaluation_to_logger(out, results, docking_mode, logger, one_line=False):
+    """Log the same blocks as CLI evaluate_diffusion after run_evaluation. If one_line, also log METRICS_ONE_LINE_*."""
+    validity_dict = {k: out[k] for k in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']}
+    print_dict(validity_dict, logger)
+
+    bond_js_keys = [k for k in out if k.startswith('JSD_') and k not in ('JSD_CC_2A', 'JSD_All_12A')]
+    pair_js_keys = [k for k in ('JSD_CC_2A', 'JSD_All_12A') if k in out]
+    c_bond_length_dict = {k: out[k] for k in bond_js_keys}
+    success_js_metrics = {k: out[k] for k in pair_js_keys}
+    if c_bond_length_dict:
+        logger.info('JS bond distances of complete mols: ')
+        print_dict(c_bond_length_dict, logger)
+    if success_js_metrics:
+        print_dict(success_js_metrics, logger)
+
+    logger.info('Atom type JS: %s' % out.get('atom_type_js'))
+    logger.info('Number of reconstructed mols: %d, complete mols: %d, evaluated mols: %d' % (
+        out['n_recon'], out['n_complete'], out['n_eval']))
+
+    qed = [r['chem_results']['qed'] for r in results]
+    if qed:
+        logger.info('QED:   Mean: %.3f Median: %.3f' % (out['QED_mean'], out['QED_med']))
+        logger.info('SA:    Mean: %.3f Median: %.3f' % (out['SA_mean'], out['SA_med']))
+    else:
+        logger.info('QED:   Mean: None Median: None')
+        logger.info('SA:    Mean: None Median: None')
+    if docking_mode == 'qvina' and results:
+        vina = [r['vina'][0]['affinity'] for r in results]
+        logger.info('Vina:  Mean: %.3f Median: %.3f' % (np.mean(vina), np.median(vina)))
+    elif docking_mode in ['vina_dock', 'vina_score'] and results:
+        vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
+        vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
+        logger.info('Vina Score:  Mean: %.3f Median: %.3f' % (np.mean(vina_score_only), np.median(vina_score_only)))
+        logger.info('Vina Min  :  Mean: %.3f Median: %.3f' % (np.mean(vina_min), np.median(vina_min)))
+        if docking_mode == 'vina_dock':
+            vina_dock = [r['vina']['dock'][0]['affinity'] for r in results]
+            logger.info('Vina Dock :  Mean: %.3f Median: %.3f' % (np.mean(vina_dock), np.median(vina_dock)))
+
+    print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
+
+    if one_line:
+        names_tsv, vals_tsv = metrics_one_line_tsv_parts(out, results, docking_mode)
+        logger.info('METRICS_ONE_LINE_HEAD\t' + names_tsv)
+        logger.info('METRICS_ONE_LINE_VAL\t' + vals_tsv)
+        return names_tsv, vals_tsv
+    return None, None
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('sample_path', type=str)
@@ -225,7 +330,7 @@ if __name__ == '__main__':
     parser.add_argument('--save', type=eval, default=True)
     parser.add_argument('--protein_root', type=str, default='./data/test_set')
     parser.add_argument('--atom_enc_mode', type=str, default='add_aromatic')
-    parser.add_argument('--docking_mode', type=str, choices=['qvina', 'vina_score', 'vina_dock', 'none'])
+    parser.add_argument('--docking_mode', type=str, default='none', choices=['qvina', 'vina_score', 'vina_dock', 'none'])
     parser.add_argument('--exhaustiveness', type=int, default=16)
     parser.add_argument('--one_line', action='store_true', help='Print all metrics in one line at the end (no ring size)')
     args = parser.parse_args()
@@ -246,77 +351,4 @@ if __name__ == '__main__':
         exhaustiveness=args.exhaustiveness,
         logger=logger,
     )
-    validity_dict = {k: out[k] for k in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']}
-    print_dict(validity_dict, logger)
-
-    # Bond-length JSD (from complete mols) vs pair-length JSD (CC_2A, All_12A)
-    bond_js_keys = [k for k in out if k.startswith('JSD_') and k not in ('JSD_CC_2A', 'JSD_All_12A')]
-    pair_js_keys = [k for k in ('JSD_CC_2A', 'JSD_All_12A') if k in out]
-    c_bond_length_dict = {k: out[k] for k in bond_js_keys}
-    success_js_metrics = {k: out[k] for k in pair_js_keys}
-    if c_bond_length_dict:
-        logger.info('JS bond distances of complete mols: ')
-        print_dict(c_bond_length_dict, logger)
-    if success_js_metrics:
-        print_dict(success_js_metrics, logger)
-
-    logger.info('Atom type JS: %s' % out.get('atom_type_js'))
-    logger.info('Number of reconstructed mols: %d, complete mols: %d, evaluated mols: %d' % (
-        out['n_recon'], out['n_complete'], out['n_eval']))
-
-    qed, sa = [r['chem_results']['qed'] for r in results], [r['chem_results']['sa'] for r in results]
-    if qed:
-        logger.info('QED:   Mean: %.3f Median: %.3f' % (out['QED_mean'], out['QED_med']))
-        logger.info('SA:    Mean: %.3f Median: %.3f' % (out['SA_mean'], out['SA_med']))
-    else:
-        logger.info('QED:   Mean: None Median: None')
-        logger.info('SA:    Mean: None Median: None')
-    if args.docking_mode == 'qvina' and results:
-        vina = [r['vina'][0]['affinity'] for r in results]
-        logger.info('Vina:  Mean: %.3f Median: %.3f' % (np.mean(vina), np.median(vina)))
-    elif args.docking_mode in ['vina_dock', 'vina_score'] and results:
-        vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
-        vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
-        logger.info('Vina Score:  Mean: %.3f Median: %.3f' % (np.mean(vina_score_only), np.median(vina_score_only)))
-        logger.info('Vina Min  :  Mean: %.3f Median: %.3f' % (np.mean(vina_min), np.median(vina_min)))
-        if args.docking_mode == 'vina_dock':
-            vina_dock = [r['vina']['dock'][0]['affinity'] for r in results]
-            logger.info('Vina Dock :  Mean: %.3f Median: %.3f' % (np.mean(vina_dock), np.median(vina_dock)))
-
-
-    print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
-
-    if args.one_line:
-        def _fmt(v):
-            if v is None:
-                return 'N/A'
-            if isinstance(v, float):
-                return '%.4f' % v
-            return str(v)
-        names, values = [], []
-        for name in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']:
-            names.append(name)
-            values.append(_fmt(out[name]))
-        for k in sorted(c_bond_length_dict.keys()):
-            names.append(k)
-            values.append(_fmt(out.get(k)))
-        for k in sorted(success_js_metrics.keys()):
-            names.append(k)
-            values.append(_fmt(out.get(k)))
-        names.append('atom_type_js')
-        values.append(_fmt(out.get('atom_type_js')))
-        names.extend(['n_recon', 'n_complete', 'n_eval'])
-        values.extend([str(out['n_recon']), str(out['n_complete']), str(out['n_eval'])])
-        names.extend(['QED_mean', 'QED_med', 'SA_mean', 'SA_med'])
-        values.extend([_fmt(out['QED_mean']), _fmt(out['QED_med']), _fmt(out['SA_mean']), _fmt(out['SA_med'])])
-        if args.docking_mode == 'qvina' and results:
-            vina = [r['vina'][0]['affinity'] for r in results]
-            names.extend(['Vina_mean', 'Vina_med'])
-            values.extend([_fmt(np.mean(vina)), _fmt(np.median(vina))])
-        elif args.docking_mode in ['vina_dock', 'vina_score'] and results:
-            vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
-            vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
-            names.extend(['Vina_score_mean', 'Vina_score_med', 'Vina_min_mean', 'Vina_min_med'])
-            values.extend([_fmt(np.mean(vina_score_only)), _fmt(np.median(vina_score_only)), _fmt(np.mean(vina_min)), _fmt(np.median(vina_min))])
-        logger.info('METRICS_ONE_LINE_HEAD\t' + '\t '.join(names))
-        logger.info('METRICS_ONE_LINE_VAL\t' + '\t '.join(values))
+    report_evaluation_to_logger(out, results, args.docking_mode, logger, one_line=args.one_line)
