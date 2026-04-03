@@ -435,7 +435,9 @@ class ScorePosNet3D(nn.Module):
                                  force_drop=False):
         """Build per-atom condition features from per-graph bins.
 
-        The reserved `null` index represents the unconditional branch.
+        The reserved `null` index is the unconditional embedding for that scalar
+        (vina / qed / sa). During training, each of the three is dropped
+        independently with probability ``condition_dropout``.
         """
         if not self.use_condition:
             return None

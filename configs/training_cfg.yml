@@ -17,15 +17,15 @@ model:
   beta_schedule: sigmoid
 
   # EDM coordinate parameters (VEDA)
-  sigma_data: 1
-  sigma_min: 0.0003
-  sigma_max: 80
+  sigma_data: 10
+  sigma_min: 0.001
+  sigma_max: 800
   rho: 2.0
 
   # EDM sigma sampling parameters (training only)
   # sigma ~ LogNormal(P_mean, P_std^2) as per EDM paper
-  edm_p_mean: -1.86   # mean in log-space, was -1.26
-  edm_p_std: 1.56     # std in log-space, was 1.41
+  edm_p_mean: -0.12   # mean in log-space
+  edm_p_std: 1.70     # std in log-space
 
 
   # Discrete FM attribute parameters (VEDA)
@@ -40,7 +40,7 @@ model:
   v_beta_s: 0.01
   num_diffusion_timesteps: 100
   loss_pos_weight: 3.0
-  loss_v_weight: 0.3
+  loss_v_weight: 3.
   bond_loss: false
   bond_input: false
   use_bond_edge_feats: false   # Adopt Edge-to-Attention mechanism (VEDA-style)
@@ -49,7 +49,7 @@ model:
   loss_non_bond_weight: 0.01   # suppress no-bond class dominance
   sample_time_method: symmetric  # ['importance', 'symmetric']
   use_condition: true           # Optional: enable condition conditioning
-  condition_dropout: 0.2         # Optional: drop all conditions together during training
+  condition_dropout: 0.5         # Optional: drop all conditions together during training
   condition_bins: 5              # Optional: number of bins per property
   condition_emb_dim: 8           # Optional: per-property embedding dim
 
@@ -57,7 +57,7 @@ model:
   time_emb_mode: sin  # ['simple', 'sin'] - sin recommended for VEDA
   time_scheduler: log_uniform  # VEDA sampling: ['log_uniform', 'arcsin', 'edm', 'edm1']
   center_pos_mode: protein
-  rescale_factor: 0.2
+  rescale_factor: 1.0
 
   veda_x_pred_mode: constant
 

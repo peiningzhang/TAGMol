@@ -1,5 +1,0 @@
-Submitting Diffusion model training job...
-Submitted batch job 23118021
-
-Job submitted. Check status with: squeue -u $USER
-Logs will be saved to: logs/
