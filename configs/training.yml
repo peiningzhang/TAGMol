@@ -92,6 +92,9 @@ train:
   quick_eval_num_proteins: 10
   quick_eval_num_ligands_per_protein: 10
   pos_noise_std: 0.1
+  pocket_noise_mode: fixed
+  pocket_noise_sigma_coeff: 0.05
+  pocket_noise_max: 0.3
   max_grad_norm: 8.0
   optimizer:
     type: adam

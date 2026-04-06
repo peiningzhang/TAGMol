@@ -1,13 +1,13 @@
 # 蛋白 pocket 扰动 `pos_noise_std = 0.1`：是否可与时间 \(t\)（或 σ）挂钩？
 
-本文档说明训练中对蛋白坐标施加的固定高斯扰动（配置项 `train.pos_noise_std`，默认 **0.1**）的语义，并讨论将其与扩散噪声级别 **σ**（或与 σ 单调对应的“有效时间”）联动的几种方案。**仅为设计分析**，不涉及具体代码改动。
+本文档说明训练中对蛋白坐标施加的高斯扰动（配置项 `train.pos_noise_std` 等）的语义，并讨论将其与扩散噪声级别 **σ** 联动的方案。方案 A（σ 比例 + clamp）已在代码中可选启用（`pocket_noise_mode: sigma_scaled`）；默认 `fixed` 与原先固定 `pos_noise_std` 行为一致。
 
 ## 1. 当前行为（简要）
 
 实现位置概览：
 
-- 训练：`scripts/train_diffusion.py`（及 `scripts/train_dock_guide.py` 等）在调用 `get_diffusion_loss` / `get_loss` 前，对 `batch.protein_pos` 加上 `torch.randn_like * config.train.pos_noise_std`。
-- 配体：在 `models/molopt_score_model.py` 的 `get_diffusion_loss`（及 guide 模型中）按 **VEDA/EDM** 的 **σ** 对配体位置加噪。
+- 训练（VEDA）：在 `models/molopt_score_model.py` 的 `get_diffusion_loss` 与 `models/molopt_guide_model.py` 的 `get_loss` 内，**先**按与配体相同的规则采样 **σ**，再按 `train.pocket_noise_mode` 对 **`batch.protein_pos`（未 center）** 加噪，**然后** `center_pos_rescale` 并与配体一同后续加噪。脚本侧传入干净蛋白坐标。
+- 配体：在同一函数内按 **VEDA/EDM** 的 **σ** 对配体位置加噪。
 - 配置：`configs/training_cfg.yml` 等中 `train.pos_noise_std: 0.1`。
 - 采样：`scripts/sample_diffusion.py` 等通常将数据里的 **`batch.protein_pos` 原样**作为条件，**不再**加该训练用扰动。
 
@@ -80,7 +80,17 @@
 2. **推理对齐**：明确采样是否始终用干净 pocket；若希望一致，可考虑训练后期 \(\sigma_{\text{pocket}}\to 0\) 或小 \(\lambda\)。
 3. **多脚本一致性**：若同时训练 score 与 dock guide，两者若都使用 `pos_noise_std`，新调度应对 **两条管线** 一并评估，避免只改其一导致分布错配。
 
-## 6. 小结
+## 6. 配置项（方案 A 实现）
+
+在 `train` 段中（与 `pos_noise_std` 并列）：
+
+- `pocket_noise_mode`: `fixed`（默认，行为与原先固定 `pos_noise_std` 一致）、`sigma_scaled` 或 `sigma_sqrt_scaled`
+- `pocket_noise_sigma_coeff`: 与 σ（或 `sqrt(σ)`）相乘的系数（默认 `0.05`）
+- `pocket_noise_max`: σ 比例 pocket 噪声上限（默认 `0.3`）
+
+`fixed` 时仅使用 `pos_noise_std`，忽略 σ。`sigma_scaled` 时使用 `clamp(sigma * pocket_noise_sigma_coeff, min=0, max=pocket_noise_max)`；`sigma_sqrt_scaled` 时使用 `clamp(sqrt(sigma) * pocket_noise_sigma_coeff, min=0, max=pocket_noise_max)` 作为每条图、每个蛋白原子的标准差。
+
+## 7. 小结
 
 - **可以**将蛋白扰动与 **σ**（或与 σ 单调对应的有效扩散阶段）挂钩；从实现与直觉上 **方案 A（\(\lambda\sigma\) + 必要时 clamp）** 最直接。
 - **固定 0.1** 的优点是简单，作为与 σ 无关的随机口袋抖动；缺点是与扩散阶段尺度 **解耦**，且与 **无噪推理 pocket** 的差异无法随 σ 解释。

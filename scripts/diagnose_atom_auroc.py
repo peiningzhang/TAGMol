@@ -58,7 +58,7 @@ def diagnose_auroc(config, checkpoint_path=None, device='cuda', num_samples=100)
     model = ScorePosNet3D(
         config.model,
         protein_atom_feature_dim=protein_featurizer.feature_dim,
-        ligand_atom_feature_dim=ligand_featurizer.feature_dim
+        ligand_atom_feature_dim=ligand_featurizer.feature_dim,
     ).to(device)
     
     if checkpoint_path:

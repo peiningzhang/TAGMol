@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 from models.common import compose_context, ShiftedSoftplus
 from models.egnn import EGNN
 from utils.misc import DFMTimeScheduler
+from utils.pocket_noise import apply_training_pocket_pos_noise
 
 
 def get_refine_net(refine_net_type, config):
@@ -196,9 +197,20 @@ class SinusoidalPosEmb(nn.Module):
 # Model
 class DockGuideNet3D(nn.Module):
 
-    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim):
+    def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim, train_config=None):
         super().__init__()
         self.config = config
+
+        def _read_train(key, default):
+            if train_config is None:
+                return default
+            v = getattr(train_config, key, None)
+            return default if v is None else v
+
+        self.pocket_noise_mode = str(_read_train('pocket_noise_mode', 'fixed'))
+        self.pos_noise_std = float(_read_train('pos_noise_std', 0.1))
+        self.pocket_noise_sigma_coeff = float(_read_train('pocket_noise_sigma_coeff', 0.05))
+        self.pocket_noise_max = float(_read_train('pocket_noise_max', 0.3))
 
         # variance schedule
         self.model_mean_type = config.model_mean_type  # ['noise', 'C0']
@@ -501,27 +513,41 @@ class DockGuideNet3D(nn.Module):
             self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, dock, time_step=None, return_pred=False
     ):
         num_graphs = batch_protein.max().item() + 1
-        protein_pos, ligand_pos, _ = center_pos_rescale(
-            protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode, rescale_factor=self.rescale_factor)
-
         if self.diffusion_type == 'veda':
-            # === VEDA: EDM (pos) + DFM (v) noising ===
             device = protein_pos.device
             if time_step is None:
-                # Training: sigma ~ LogNormal(P_mean, P_std^2)
                 P_mean = getattr(self.config, 'edm_p_mean', -1.2)
                 P_std = getattr(self.config, 'edm_p_std', 1.2)
                 rnd_normal = torch.randn(num_graphs, device=device)
                 sigma = (rnd_normal * P_std + P_mean).exp()
                 sigma = sigma.clamp(self.sigma_min, self.sigma_max)
             else:
-                # Validation: map time_step to sigma (log_uniform)
                 timestep_ratio = time_step.float() / (self.num_timesteps - 1)
-                log_sigma_max = torch.log(torch.tensor(self.sigma_max, device=device))
-                log_sigma_min = torch.log(torch.tensor(self.sigma_min, device=device))
+                log_sigma_max = torch.log(
+                    torch.tensor(self.sigma_max, device=device, dtype=protein_pos.dtype)
+                )
+                log_sigma_min = torch.log(
+                    torch.tensor(self.sigma_min, device=device, dtype=protein_pos.dtype)
+                )
                 log_sigma = log_sigma_max + timestep_ratio * (log_sigma_min - log_sigma_max)
                 sigma = torch.exp(log_sigma)
 
+            protein_pos = apply_training_pocket_pos_noise(
+                protein_pos,
+                batch_protein,
+                sigma,
+                mode=self.pocket_noise_mode,
+                pos_noise_std=self.pos_noise_std,
+                sigma_coeff=self.pocket_noise_sigma_coeff,
+                max_pocket_noise=self.pocket_noise_max,
+            )
+
+        protein_pos, ligand_pos, _ = center_pos_rescale(
+            protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode, rescale_factor=self.rescale_factor)
+
+        if self.diffusion_type == 'veda':
+            # === VEDA: EDM (pos) + DFM (v) noising ===
+            device = protein_pos.device
             sigma_per_atom = sigma[batch_ligand].unsqueeze(-1)
             pos_noise = torch.randn_like(ligand_pos, device=device)
             ligand_pos_perturbed = ligand_pos + sigma_per_atom * pos_noise

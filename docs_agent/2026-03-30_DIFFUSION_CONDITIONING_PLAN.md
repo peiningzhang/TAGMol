@@ -5,6 +5,7 @@
 为 TAGMol 的 diffusion 训练加入显式 condition，并保留 classifier-free guidance（CFG）路径。
 
 条件来源：
+
 - `vina_score`
 - `QED`
 - `SA`
@@ -70,6 +71,7 @@
 ### 输出格式
 
 每个样本保存：
+
 - `vina_bin`
 - `qed_bin`
 - `sa_bin`
@@ -83,6 +85,7 @@
 ### 1. 新增 condition embedding
 
 在模型中加入：
+
 - `vina_embedding`
 - `qed_embedding`
 - `sa_embedding`
@@ -104,12 +107,14 @@ vina_emb + qed_emb + sa_emb
 ### 3. 输入接口改造
 
 模型 forward 需要显式接受：
+
 - `vina_bin`
 - `qed_bin`
 - `sa_bin`
 - `cond_drop_flag` 或已处理后的 `cond_token`
 
 无条件分支可通过：
+
 - batch 内统一替换为 `null` 类
 - 或由 forward 内部根据 drop mask 处理
 
@@ -140,8 +145,8 @@ vina_emb + qed_emb + sa_emb
 1. 输入目标 condition
 2. 同时构造一份 `null` condition
 3. 对每一步扩散做两次前向：
-   - `cond`
-   - `uncond`
+  - `cond`
+  - `uncond`
 4. 用 CFG 合成最终预测
 
 ### guidance scale
@@ -154,6 +159,7 @@ vina_emb + qed_emb + sa_emb
 ## 建议修改文件
 
 优先检查和修改：
+
 - `models/molopt_score_model.py`
 - `scripts/train_diffusion.py`
 - `scripts/sample_diffusion.py`
@@ -164,11 +170,11 @@ vina_emb + qed_emb + sa_emb
 
 ## 验收标准
 
-- [ ] 训练时能正确读取三项 condition
-- [ ] `p_drop = 0.2` 时无条件分支能稳定工作
-- [ ] `cond_token` 能作为额外 token 进入 backbone
-- [ ] 推理时可单独跑 cond / uncond
-- [ ] CFG 采样结果对目标桶有方向性变化
+- 训练时能正确读取三项 condition
+- `p_drop = 0.2` 时无条件分支能稳定工作
+- `cond_token` 能作为额外 token 进入 backbone
+- 推理时可单独跑 cond / uncond
+- CFG 采样结果对目标桶有方向性变化
 
 ---
 
@@ -177,3 +183,4 @@ vina_emb + qed_emb + sa_emb
 - 5 桶可能过粗，条件信息损失较明显
 - 桶分布不均衡会影响控制效果
 - 三个属性同时控制时可能存在 trade-off，需要后续做权重和 guidance sweep
+

@@ -183,7 +183,8 @@ if __name__ == '__main__':
     model = DockGuideNet3D(
         config.model,
         protein_atom_feature_dim=protein_featurizer.feature_dim,
-        ligand_atom_feature_dim=ligand_featurizer.feature_dim
+        ligand_atom_feature_dim=ligand_featurizer.feature_dim,
+        train_config=config.train,
     ).to(args.device)
     # print(model)
     print(f'protein feature dim: {protein_featurizer.feature_dim} ligand feature dim: {ligand_featurizer.feature_dim}')
@@ -225,7 +226,7 @@ if __name__ == '__main__':
         score_model = ScorePosNet3D(
             score_cfg.model,
             protein_atom_feature_dim=protein_featurizer.feature_dim,
-            ligand_atom_feature_dim=ligand_featurizer.feature_dim
+            ligand_atom_feature_dim=ligand_featurizer.feature_dim,
         ).to(args.device)
         score_model.load_state_dict(ckpt['model'])
         score_model.eval()
@@ -245,13 +246,11 @@ if __name__ == '__main__':
         avg_loss = 0
         for _ in range(config.train.n_acc_batch):
             batch = next(train_iterator).to(args.device)
-            protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
-            gt_protein_pos = batch.protein_pos + protein_noise
             dock = batch[config.train.get("target", "vina_dock")]
             if normalize_target:
                 dock = (dock - target_mean) / (target_std + 1e-8)
             loss = model.get_loss(
-                protein_pos=gt_protein_pos,
+                protein_pos=batch.protein_pos,
                 protein_v=batch.protein_atom_feature.float(),
                 batch_protein=batch.protein_element_batch,
 

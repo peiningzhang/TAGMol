@@ -234,7 +234,7 @@ if __name__ == '__main__':
     model = ScorePosNet3D(
         config.model,
         protein_atom_feature_dim=protein_featurizer.feature_dim,
-        ligand_atom_feature_dim=ligand_featurizer.feature_dim
+        ligand_atom_feature_dim=ligand_featurizer.feature_dim,
     ).to(args.device)
     # print(model)
     print(f'protein feature dim: {protein_featurizer.feature_dim} ligand feature dim: {ligand_featurizer.feature_dim}')
@@ -297,10 +297,8 @@ if __name__ == '__main__':
                 logger.info(f'[TRIAL] First batch - protein atoms: {batch.protein_pos.shape[0]}, '
                            f'ligand atoms: {batch.ligand_pos.shape[0]}')
 
-            protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
-            gt_protein_pos = batch.protein_pos + protein_noise
             results = model.get_diffusion_loss(
-                protein_pos=gt_protein_pos,
+                protein_pos=batch.protein_pos,
                 protein_v=batch.protein_atom_feature.float(),
                 batch_protein=batch.protein_element_batch,
 

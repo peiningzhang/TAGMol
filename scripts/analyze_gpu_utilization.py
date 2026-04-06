@@ -71,7 +71,7 @@ def analyze_training_bottlenecks(config, device='cuda'):
     model = ScorePosNet3D(
         config.model,
         protein_atom_feature_dim=protein_featurizer.feature_dim,
-        ligand_atom_feature_dim=ligand_featurizer.feature_dim
+        ligand_atom_feature_dim=ligand_featurizer.feature_dim,
     ).to(device)
     
     num_params = misc.count_parameters(model) / 1e6
@@ -110,13 +110,11 @@ def analyze_training_bottlenecks(config, device='cuda'):
     backward_times = []
     
     batch = next(iter(train_loader)).to(device)
-    protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
-    gt_protein_pos = batch.protein_pos + protein_noise
-    
+
     # Warmup
     for _ in range(3):
         results = model.get_diffusion_loss(
-            protein_pos=gt_protein_pos,
+            protein_pos=batch.protein_pos,
             protein_v=batch.protein_atom_feature.float(),
             batch_protein=batch.protein_element_batch,
             ligand_pos=batch.ligand_pos,
@@ -132,7 +130,7 @@ def analyze_training_bottlenecks(config, device='cuda'):
         forward_start = time.time()
         
         results = model.get_diffusion_loss(
-            protein_pos=gt_protein_pos,
+            protein_pos=batch.protein_pos,
             protein_v=batch.protein_atom_feature.float(),
             batch_protein=batch.protein_element_batch,
             ligand_pos=batch.ligand_pos,
