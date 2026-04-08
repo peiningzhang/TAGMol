@@ -7,9 +7,10 @@ from rdkit import RDLogger
 import torch
 from tqdm.auto import tqdm
 from glob import glob
-from collections import Counter
+from collections import Counter, defaultdict
 
 from utils.evaluation import eval_atom_type, scoring_func, analyze, eval_bond_length
+from utils.evaluation.similarity import mean_pairwise_tanimoto
 from utils import misc, reconstruct, transforms
 from utils.evaluation.docking_qvina import QVinaDockingTask
 from utils.evaluation.docking_vina import VinaDockingTask
@@ -212,6 +213,34 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
     except Exception as e:
         logger.warning(f"Error calculating Vina metrics: {e}")
         out['Vina_score_mean'] = out['Vina_score_med'] = out['Vina_min_mean'] = out['Vina_min_med'] = None
+
+    # Per-pocket: mean pairwise RDK Tanimoto among generated mols; Diversity = 1 - that mean (macro avg over pockets).
+    try:
+        pocket_key_to_mols = defaultdict(list)
+        for r in results:
+            pk = r.get('protein_filename') or r.get('ligand_filename') or 'unknown'
+            pocket_key_to_mols[pk].append(r['mol'])
+        pocket_mean_sims = []
+        pocket_divs = []
+        for mols in pocket_key_to_mols.values():
+            mp = mean_pairwise_tanimoto(mols)
+            if mp is not None:
+                pocket_mean_sims.append(mp)
+                pocket_divs.append(1.0 - mp)
+        if pocket_mean_sims:
+            out['Mean_pairwise_Tanimoto'] = float(np.mean(pocket_mean_sims))
+            out['Diversity'] = float(np.mean(pocket_divs))
+            out['Diversity_med'] = float(np.median(pocket_divs))
+        else:
+            out['Mean_pairwise_Tanimoto'] = None
+            out['Diversity'] = None
+            out['Diversity_med'] = None
+    except Exception as e:
+        logger.warning(f"Error calculating RDK fingerprint diversity: {e}")
+        out['Mean_pairwise_Tanimoto'] = None
+        out['Diversity'] = None
+        out['Diversity_med'] = None
+
     if save:
         validity_dict = {k: out[k] for k in ['mol_stable', 'atm_stable', 'recon_success', 'eval_success', 'complete']}
         torch.save({'stability': validity_dict, 'bond_length': all_bond_dist, 'all_results': results},
@@ -253,6 +282,14 @@ def metrics_one_line_tsv_parts(out, results, docking_mode):
     values.extend([str(out['n_recon']), str(out['n_complete']), str(out['n_eval'])])
     names.extend(['QED_mean', 'QED_med', 'SA_mean', 'SA_med'])
     values.extend([_fmt(out['QED_mean']), _fmt(out['QED_med']), _fmt(out['SA_mean']), _fmt(out['SA_med'])])
+    names.extend(['Mean_pairwise_Tanimoto', 'Diversity', 'Diversity_med'])
+    values.extend(
+        [
+            _fmt(out.get('Mean_pairwise_Tanimoto')),
+            _fmt(out.get('Diversity')),
+            _fmt(out.get('Diversity_med')),
+        ]
+    )
     if docking_mode == 'qvina' and results:
         vina = [r['vina'][0]['affinity'] for r in results]
         names.extend(['Vina_mean', 'Vina_med'])
@@ -299,6 +336,13 @@ def report_evaluation_to_logger(out, results, docking_mode, logger, one_line=Fal
     else:
         logger.info('QED:   Mean: None Median: None')
         logger.info('SA:    Mean: None Median: None')
+    if out.get('Diversity') is not None:
+        logger.info(
+            'Diversity (RDK fp): Mean pairwise Tanimoto %.4f | Diversity mean: %.4f | Diversity median: %.4f'
+            % (out['Mean_pairwise_Tanimoto'], out['Diversity'], out['Diversity_med'])
+        )
+    else:
+        logger.info('Diversity (RDK fp): N/A (need >=2 mols per pocket with valid fps)')
     if docking_mode == 'qvina' and results:
         vina = [r['vina'][0]['affinity'] for r in results]
         logger.info('Vina:  Mean: %.3f Median: %.3f' % (np.mean(vina), np.median(vina)))

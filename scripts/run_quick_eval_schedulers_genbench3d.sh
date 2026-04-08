@@ -2,8 +2,9 @@
 
 # SCHEDULERS=("log_uniform" "arcsin" "edm" "edm1")
 # SCHEDULERS=("log_uniform" "arcsin" "edm1")
-SCHEDULERS=("log_uniform" "edm1")
-CFG_SCALES=(0 1)
+# SCHEDULERS=("log_uniform" "edm1")
+SCHEDULERS=("edm1")
+CFG_SCALES=(0 0.5 1.0 2.0 3.0 5.0)
 for SCHED in "${SCHEDULERS[@]}"
 do
     for CFG in "${CFG_SCALES[@]}"
@@ -12,8 +13,8 @@ do
         echo "Running quick_evaluate: time_scheduler=$SCHED cfg_scale=$CFG"
         echo "=========================================================="
         python scripts/quick_evaluate.py \
-            --config logs_diffusion/training_cfg_2026_04_04__00_46_05/sampling.yml \
-            --checkpoint logs_diffusion/training_cfg_2026_04_04__00_46_05/checkpoints/last.pt \
+            --config logs_diffusion/training_cfg_2026_04_06__15_22_09/sampling.yml \
+            --checkpoint logs_diffusion/training_cfg_2026_04_06__15_22_09/checkpoints/last.pt \
             --num_proteins 100 \
             --num_ligands_per_protein 10 \
             --docking_mode vina_score \
