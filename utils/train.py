@@ -1,6 +1,8 @@
 import copy
 import warnings
 
+from utils.muon import build_muon_optimizer
+
 import numpy as np
 import torch
 from torch_geometric.data import Data, Batch
@@ -59,6 +61,32 @@ def get_optimizer(cfg, model):
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
             betas=(cfg.beta1, cfg.beta2,)
+        )
+    elif cfg.type == 'muon':
+        # Muon for hidden 2-D weight matrices + AdamW for all other params.
+        # Config keys (all optional, defaults shown):
+        #   muon_lr            (default 0.02)   – Muon spectral learning rate
+        #   muon_momentum      (default 0.95)
+        #   muon_weight_decay  (default 0.0)
+        #   lr                 (default 3e-4)   – AdamW lr for non-Muon params
+        #   weight_decay       (default 0.0)    – AdamW weight decay
+        #   beta1, beta2       (default 0.9, 0.95)
+        #   eps                (default 1e-8)
+        #   ns_steps           (default 5)      – Newton-Schulz iterations
+        #   muon_exclude_keywords (default ['embed']) – param-name substrings
+        #                           whose tensors are always sent to AdamW
+        exclude_kws = tuple(getattr(cfg, 'muon_exclude_keywords', ['embed']))
+        return build_muon_optimizer(
+            model,
+            muon_lr=getattr(cfg, 'muon_lr', 0.02),
+            muon_momentum=getattr(cfg, 'muon_momentum', 0.95),
+            muon_weight_decay=getattr(cfg, 'muon_weight_decay', 0.0),
+            adam_lr=getattr(cfg, 'lr', 3e-4),
+            adam_betas=(getattr(cfg, 'beta1', 0.9), getattr(cfg, 'beta2', 0.95)),
+            adam_eps=getattr(cfg, 'eps', 1e-8),
+            adam_weight_decay=getattr(cfg, 'weight_decay', 0.0),
+            muon_exclude_keywords=exclude_kws,
+            ns_steps=getattr(cfg, 'ns_steps', 5),
         )
     else:
         raise NotImplementedError('Optimizer not supported: %s' % cfg.type)
