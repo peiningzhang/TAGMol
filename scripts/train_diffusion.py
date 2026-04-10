@@ -314,6 +314,7 @@ if __name__ == '__main__':
             )
             loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
             loss_bond = results.get('loss_bond', torch.tensor(0.))
+            loss_certainty_atomics = results.get('loss_certainty_atomics', torch.tensor(0.))
             loss = loss / config.train.n_acc_batch
             loss.backward()
         orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
@@ -321,8 +322,8 @@ if __name__ == '__main__':
 
         if it % args.train_report_iter == 0:
             logger.info(
-                '[Train] Iter %d | Loss %.6f (pos %.6f | v %.6f | bond %.6f) | Lr: %.6f | Grad Norm: %.6f' % (
-                    it, loss, loss_pos, loss_v, loss_bond, optimizer.param_groups[0]['lr'], orig_grad_norm
+                '[Train] Iter %d | Loss %.6f (pos %.6f | v %.6f | bond %.6f | cert_atom %.6f) | Lr: %.6f | Grad Norm: %.6f' % (
+                    it, loss, loss_pos, loss_v, loss_bond, loss_certainty_atomics, optimizer.param_groups[0]['lr'], orig_grad_norm
                 )
             )
 

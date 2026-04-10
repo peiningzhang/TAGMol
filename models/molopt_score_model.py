@@ -267,6 +267,11 @@ class ScorePosNet3D(nn.Module):
         self.bond_loss = getattr(config, 'bond_loss', False)
         self.loss_bond_weight = getattr(config, 'loss_bond_weight', 1.0)
         self.loss_non_bond_weight = getattr(config, 'loss_non_bond_weight', 0.1)
+        # Certainty loss hyperparams
+        self.use_certainty_loss = getattr(config, 'use_certainty_loss', False)
+        self.certainty_loss_weight = getattr(config, 'certainty_loss_weight', 0.1)
+        self.certainty_loss_atomics_weight = getattr(config, 'certainty_loss_atomics_weight', 1.0)
+        self.certainty_loss_sum_mode = getattr(config, 'certainty_loss_sum_mode', False)
         # Optional condition path: disabled by default to preserve old behavior
         self.use_condition = getattr(config, 'use_condition', False)
         self.condition_dropout = getattr(config, 'condition_dropout', 0.0) if self.use_condition else 0.0
@@ -421,6 +426,55 @@ class ScorePosNet3D(nn.Module):
             # Projects per-atom bond statistics into hidden space and adds to ligand embedding
             if self.bond_input:
                 self.bond_context_projector = nn.Linear(5, emb_dim)
+
+    def _compute_certainty_loss_atoms(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """Atom-type certainty loss (flat per-atom format).
+
+        Penalises the entropy of the predicted distribution **only** at positions
+        where the argmax prediction already matches the ground-truth atom type.
+        This encourages the model to become more confident when it is correct.
+
+        Args:
+            logits:  [N, V]  raw logits from v_inference.
+            targets: [N]     ground-truth atom-type indices (LongTensor).
+            batch:   [N]     graph index for each atom.
+
+        Returns:
+            Scalar certainty loss for atomics.
+        """
+        # Predicted class and correctness mask
+        pred_tokens = logits.argmax(dim=-1)          # [N]
+        correct_mask = (pred_tokens == targets)       # [N] bool
+
+        if correct_mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+        # Numerically-stable entropy: H = -sum(p * log p)
+        log_probs = F.log_softmax(logits, dim=-1)    # [N, V]
+        probs = log_probs.exp()                       # [N, V]
+        entropy = -(probs * log_probs).sum(dim=-1)   # [N]
+
+        if self.certainty_loss_sum_mode:
+            # Sum entropy at correct positions, normalise by total valid atoms
+            n_valid = float(logits.shape[0])
+            certainty_loss = (entropy * correct_mask.float()).sum() / max(n_valid, 1e-6)
+        else:
+            # Mean entropy over correct positions, then average over graphs
+            correct_entropy = entropy * correct_mask.float()          # [N]
+            n_correct_per_graph = scatter_sum(
+                correct_mask.float(), batch, dim=0
+            ).clamp(min=1e-6)                                         # [B]
+            entropy_per_graph = scatter_sum(
+                correct_entropy, batch, dim=0
+            ) / n_correct_per_graph                                   # [B]
+            certainty_loss = entropy_per_graph.mean()
+
+        return certainty_loss
 
     def get_edm_scaling(self, sigma):
         """EDM scaling coefficients: c_skip, c_out, c_in, c_noise (Karras et al.)."""
@@ -945,6 +999,16 @@ class ScorePosNet3D(nn.Module):
 
             loss = self.loss_pos_weight * loss_pos + self.loss_v_weight * loss_v
 
+            # Certainty loss: entropy penalty on correctly-predicted atom types
+            loss_certainty_atomics = torch.tensor(0., device=device)
+            if self.use_certainty_loss:
+                loss_certainty_atomics = self._compute_certainty_loss_atoms(
+                    logits=pred_ligand_v,
+                    targets=ligand_v,
+                    batch=batch_ligand,
+                )
+                loss = loss + self.certainty_loss_weight * self.certainty_loss_atomics_weight * loss_certainty_atomics
+
             # Bond loss: explicit bond type prediction
             loss_bond = torch.tensor(0., device=device)
             if self.bond_loss and ligand_bond_index is not None and 'pred_bond_logits' in preds:
@@ -971,6 +1035,7 @@ class ScorePosNet3D(nn.Module):
                 'loss_pos': loss_pos,
                 'loss_v': loss_v,
                 'loss_bond': loss_bond,
+                'loss_certainty_atomics': loss_certainty_atomics,
                 'loss': loss,
                 'x0': ligand_pos,
                 'pred_ligand_pos': pred_ligand_pos,

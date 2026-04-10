@@ -41,6 +41,16 @@ model:
   num_diffusion_timesteps: 100
   loss_pos_weight: 3.0
   loss_v_weight: 3.
+
+  # --- Certainty Loss (v_loss auxiliary) ---
+  # Penalizes entropy of correctly-predicted discrete tokens,
+  # encouraging the model to be more confident when it is right.
+  use_certainty_loss: true            # Enable certainty loss
+  certainty_loss_weight: 0.1          # Global scale applied to total certainty-loss
+  certainty_loss_atomics_weight: 1.0  # Per-type relative weight for atom-type certainty
+  certainty_loss_sum_mode: false      # false = mean over correct positions (default);
+
+
   bond_loss: false
   bond_input: false
   use_bond_edge_feats: false   # Adopt Edge-to-Attention mechanism (VEDA-style)
@@ -102,21 +112,11 @@ train:
   pocket_noise_max: 0.5
   max_grad_norm: 8.0
   optimizer:
-    type: muon
-    # --- Muon (for hidden 2-D weight matrices) ---
-    muon_lr: 0.001           # spectral-norm learning rate (not comparable to Adam lr; tune empirically)
-    muon_momentum: 0.95
-    muon_weight_decay: 0.0
-    ns_steps: 5             # Newton-Schulz iterations (5 is the default)
-    # --- AdamW (for embeddings, biases, scalars, output layer) ---
-    lr: 1.0e-4              # same as the old Adam lr; controls non-Muon params
-    beta1: 0.9
-    beta2: 0.95
-    eps: 1.0e-8
-    weight_decay: 0.0
-    # --- Parameter routing ---
-    muon_exclude_keywords:  # params whose names contain these go to AdamW
-      - embed
+    type: adam
+    lr: 0.0001 #5.e-4
+    weight_decay: 0
+    beta1: 0.95
+    beta2: 0.999
   scheduler:
     type: plateau
     factor: 0.6

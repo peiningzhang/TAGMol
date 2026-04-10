@@ -59,7 +59,7 @@ model:
   center_pos_mode: protein
   rescale_factor: 1.0
 
-  veda_x_pred_mode: adaptive
+  veda_x_pred_mode: constant
 
   node_indicator: True
   model_type: uni_o2
@@ -92,13 +92,13 @@ train:
   quick_eval_freq: 10000
   quick_eval_num_proteins: 10
   quick_eval_num_ligands_per_protein: 10
-  pos_noise_std: 0.1
+  pos_noise_std: 0.0
   # pocket noise vs ligand EDM sigma:
   # fixed = pos_noise_std only
   # sigma_scaled = clamp(sigma * coeff, max)
   # sigma_sqrt_scaled = clamp(sqrt(sigma) * coeff, max)
-  pocket_noise_mode: sigma_scaled   # fixed | sigma_scaled | sigma_sqrt_scaled
-  pocket_noise_sigma_coeff: 0.1
+  pocket_noise_mode: fixed   # fixed | sigma_scaled | sigma_sqrt_scaled
+  pocket_noise_sigma_coeff: 0.0
   pocket_noise_max: 0.5
   max_grad_norm: 8.0
   optimizer:
