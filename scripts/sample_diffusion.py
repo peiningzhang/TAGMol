@@ -30,7 +30,7 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 
 def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cuda:0',
                             num_steps=None, pos_only=False, center_pos_mode='protein',
-                            sample_num_atoms='prior', cfg_scale=0.0):
+                            sample_num_atoms='prior', cfg_scale=0.0, cfg_strategy='always'):
     all_pred_pos, all_pred_v = [], []
     all_pred_pos_traj, all_pred_pos0_traj, all_pred_v_traj = [], [], []
     all_pred_v0_traj, all_pred_vt_traj = [], []
@@ -81,6 +81,7 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
                 pos_only=pos_only,
                 center_pos_mode=center_pos_mode,
                 cfg_scale=cfg_scale,
+                cfg_strategy=cfg_strategy,
                 vina_bin=getattr(batch, 'vina_bin', None),
                 qed_bin=getattr(batch, 'qed_bin', None),
                 sa_bin=getattr(batch, 'sa_bin', None),

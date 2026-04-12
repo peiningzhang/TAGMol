@@ -1350,7 +1350,8 @@ class ScorePosNet3D(nn.Module):
     def sample_diffusion(self, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False,
-                         cfg_scale=0.0, vina_bin=None, qed_bin=None, sa_bin=None):
+                         cfg_scale=0.0, vina_bin=None, qed_bin=None, sa_bin=None,
+                         cfg_strategy='always'):
         """ Denoise the init_ligand_pos and init_ligand_v.
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -1413,6 +1414,7 @@ class ScorePosNet3D(nn.Module):
             noise_injection_rate = 0.4
             noise_injection_high_threshold = 3
             noise_injection_low_threshold = 0
+            cfg_scale_max = cfg_scale
             for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
                 sigma_next = sigma_schedule[step + 1].expand(num_graphs).unsqueeze(-1)
@@ -1481,7 +1483,13 @@ class ScorePosNet3D(nn.Module):
                         sa_bin=sa_bin,
                         condition_force_drop=condition_force_drop,
                     )
-
+                _sigma_mid = sigma_schedule[n_dfm // 2].item()
+                if cfg_strategy == 'half_start' and sigma_i[0].item() > _sigma_mid:
+                    cfg_scale = 0.0
+                elif cfg_strategy == 'ramp_up':
+                    cfg_scale = (step / n_dfm) * cfg_scale_max
+                else:
+                    cfg_scale = cfg_scale_max
                 if self.use_condition and cfg_scale != 0.0 and (vina_bin is not None or qed_bin is not None or sa_bin is not None):
                     preds_cond = _run_forward(condition_force_drop=False)
                     preds_uncond = _run_forward(condition_force_drop=True)

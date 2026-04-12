@@ -221,6 +221,13 @@ def main():
     parser.add_argument('--num_ligands_per_protein', type=int, default=10, help='Number of ligands to sample per protein.')
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size for sampling.')
     parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale for conditioned models; 0.0 = unconditional (no CFG blend), >0 enables CFG.')
+    parser.add_argument('--cfg_strategy', type=str, default='always', choices=['always', 'half_start', 'ramp_up'],
+                        help='When to apply CFG during sampling. '
+                             '"always" (default): apply CFG at every denoising step. '
+                             '"half_start": skip CFG for the first (noisy) half of the schedule and '
+                             '"ramp_up": ramp up CFG from 0 to 1 over the schedule, starting from the first step.'
+                             'only enable it once sigma drops below the midpoint, letting the model '
+                             'first find rough structure unconditionally.')
     parser.add_argument('--tmp_root', type=str, default='./tmp_eval', help='Root directory to create temporary evaluation folders.')
     parser.add_argument('--eval_step', type=int, default=-1, help='Which diffusion step to evaluate (passed to evaluate_diffusion.py).')
     parser.add_argument('--docking_mode', type=str, default='none', choices=['qvina', 'vina_score', 'vina_dock', 'none'], help='Docking mode passed to evaluate_diffusion.py.')
@@ -480,6 +487,7 @@ def main():
                 center_pos_mode=ckpt_cfg.model.center_pos_mode,
                 sample_num_atoms='prior',
                 cfg_scale=args.cfg_scale,
+                cfg_strategy=args.cfg_strategy,
             )
 
         result = {
