@@ -58,10 +58,14 @@ model:
   loss_bond_weight: 0.1
   loss_non_bond_weight: 0.01   # suppress no-bond class dominance
   sample_time_method: symmetric  # ['importance', 'symmetric']
-  use_condition: true           # Optional: enable condition conditioning
-  condition_dropout: 0.5         # Optional: drop all conditions together during training
-  condition_bins: 5              # Optional: number of bins per property
-  condition_emb_dim: 8           # Optional: per-property embedding dim
+  use_condition: true           # Optional: scalar property bins (vina / qed / sa)
+  # Training dropout (see molopt_score_model._build_condition_feature): global first, then independent.
+  condition_dropout: 0.5        # Per-graph P(null all three) — full CFG-style unconditional
+  condition_dropout_vina: 0.0   # If global did not fire: per-graph P(null vina only)
+  condition_dropout_qed: 0.0    # same for qed
+  condition_dropout_sa: 0.0     # same for sa (0,0,0 recovers old “joint only” behavior)
+  condition_bins: 5             # bins per property (excluding reserved null index)
+  condition_emb_dim: 8          # per-property embedding dim before fusion
 
   time_emb_dim: 64  # Required for VEDA (EDM noise embedding); use 0 for DDPM
   time_emb_mode: sin  # ['simple', 'sin'] - sin recommended for VEDA

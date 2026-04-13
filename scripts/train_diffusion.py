@@ -239,6 +239,14 @@ if __name__ == '__main__':
     # print(model)
     print(f'protein feature dim: {protein_featurizer.feature_dim} ligand feature dim: {ligand_featurizer.feature_dim}')
     logger.info(f'# trainable parameters: {misc.count_parameters(model) / 1e6:.4f} M')
+    if getattr(config.model, 'use_condition', False):
+        logger.info(
+            'Condition training dropout: global=%.4f, vina=%.4f, qed=%.4f, sa=%.4f',
+            float(getattr(config.model, 'condition_dropout', 0.0)),
+            float(getattr(config.model, 'condition_dropout_vina', 0.0)),
+            float(getattr(config.model, 'condition_dropout_qed', 0.0)),
+            float(getattr(config.model, 'condition_dropout_sa', 0.0)),
+        )
 
     # Optimizer and scheduler
     optimizer = utils_train.get_optimizer(config.train.optimizer, model)

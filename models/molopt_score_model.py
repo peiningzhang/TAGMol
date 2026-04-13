@@ -274,7 +274,18 @@ class ScorePosNet3D(nn.Module):
         self.certainty_loss_sum_mode = getattr(config, 'certainty_loss_sum_mode', False)
         # Optional condition path: disabled by default to preserve old behavior
         self.use_condition = getattr(config, 'use_condition', False)
-        self.condition_dropout = getattr(config, 'condition_dropout', 0.0) if self.use_condition else 0.0
+        # Global: with this prob, drop all scalar conditions (vina/qed/sa) for a graph.
+        # Independent: when global did not fire, each scalar is dropped separately with its own prob.
+        if self.use_condition:
+            self.condition_dropout = getattr(config, 'condition_dropout', 0.0)
+            self.condition_dropout_vina = getattr(config, 'condition_dropout_vina', 0.0)
+            self.condition_dropout_qed = getattr(config, 'condition_dropout_qed', 0.0)
+            self.condition_dropout_sa = getattr(config, 'condition_dropout_sa', 0.0)
+        else:
+            self.condition_dropout = 0.0
+            self.condition_dropout_vina = 0.0
+            self.condition_dropout_qed = 0.0
+            self.condition_dropout_sa = 0.0
         self.condition_bins = getattr(config, 'condition_bins', 5)
         self.condition_emb_dim = getattr(config, 'condition_emb_dim', 8)
 
@@ -489,9 +500,15 @@ class ScorePosNet3D(nn.Module):
                                  force_drop=False):
         """Build per-atom condition features from per-graph bins.
 
-        The reserved `null` index is the unconditional embedding for that scalar
-        (vina / qed / sa). During training, each of the three is dropped
-        independently with probability ``condition_dropout``.
+        The reserved `null` index is the unconditional embedding for each scalar
+        (vina / qed / sa). During training:
+
+        - With probability ``condition_dropout`` per graph, all three bins are set
+          to null (global unconditional).
+        - Otherwise, ``condition_dropout_{vina,qed,sa}`` each independently drop
+          only that scalar for the graph (partial conditional).
+
+        Setting the three independent rates to 0 recovers the old joint-only behavior.
         """
         if not self.use_condition:
             return None
@@ -514,15 +531,32 @@ class ScorePosNet3D(nn.Module):
             qed_bin = torch.full_like(qed_bin, null_idx)
             sa_bin = torch.full_like(sa_bin, null_idx)
 
-        if self.training and self.condition_dropout > 0:
-            drop_mask = torch.rand(vina_bin.size(0), device=device) < self.condition_dropout
-            if drop_mask.any():
-                vina_bin = vina_bin.clone()
-                qed_bin = qed_bin.clone()
-                sa_bin = sa_bin.clone()
-                vina_bin[drop_mask] = null_idx
-                qed_bin[drop_mask] = null_idx
-                sa_bin[drop_mask] = null_idx
+        if self.training and (
+            self.condition_dropout > 0
+            or self.condition_dropout_vina > 0
+            or self.condition_dropout_qed > 0
+            or self.condition_dropout_sa > 0
+        ):
+            n_g = vina_bin.size(0)
+            vina_bin = vina_bin.clone()
+            qed_bin = qed_bin.clone()
+            sa_bin = sa_bin.clone()
+            global_drop = torch.rand(n_g, device=device) < self.condition_dropout
+            if global_drop.any():
+                vina_bin[global_drop] = null_idx
+                qed_bin[global_drop] = null_idx
+                sa_bin[global_drop] = null_idx
+            remain = ~global_drop
+            if remain.any():
+                if self.condition_dropout_vina > 0:
+                    m = torch.rand(n_g, device=device) < self.condition_dropout_vina
+                    vina_bin[remain & m] = null_idx
+                if self.condition_dropout_qed > 0:
+                    m = torch.rand(n_g, device=device) < self.condition_dropout_qed
+                    qed_bin[remain & m] = null_idx
+                if self.condition_dropout_sa > 0:
+                    m = torch.rand(n_g, device=device) < self.condition_dropout_sa
+                    sa_bin[remain & m] = null_idx
 
         cond_input = torch.cat([
             self.vina_bin_emb(vina_bin),
