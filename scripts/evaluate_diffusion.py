@@ -1,5 +1,6 @@
 import argparse
 import os
+import multiprocessing as mp
 
 import numpy as np
 from rdkit import Chem
@@ -14,6 +15,65 @@ from utils.evaluation.similarity import mean_pairwise_tanimoto
 from utils import misc, reconstruct, transforms
 from utils.evaluation.docking_qvina import QVinaDockingTask
 from utils.evaluation.docking_vina import VinaDockingTask
+
+
+def _docking_worker(payload, queue):
+    """Run docking in child process to isolate native-library crashes."""
+    try:
+        mol = Chem.MolFromMolBlock(payload['mol_block'], removeHs=False)
+        if mol is None:
+            raise ValueError('Failed to deserialize ligand mol block')
+        mode = payload['docking_mode']
+        ligand_filename = payload['ligand_filename']
+        protein_root = payload['protein_root']
+        protein_filename = payload['protein_filename']
+        exhaustiveness = payload['exhaustiveness']
+
+        if mode == 'qvina':
+            vina_task = QVinaDockingTask.from_generated_mol(
+                mol, ligand_filename=ligand_filename, protein_root=protein_root, protein_filename=protein_filename
+            )
+            vina_results = vina_task.run_sync()
+        elif mode in ['vina_score', 'vina_dock']:
+            vina_task = VinaDockingTask.from_generated_mol(
+                mol, ligand_filename=ligand_filename, protein_root=protein_root, protein_filename=protein_filename
+            )
+            score_only_results = vina_task.run(mode='score_only', exhaustiveness=exhaustiveness)
+            minimize_results = vina_task.run(mode='minimize', exhaustiveness=exhaustiveness)
+            vina_results = {'score_only': score_only_results, 'minimize': minimize_results}
+            if mode == 'vina_dock':
+                docking_results = vina_task.run(mode='dock', exhaustiveness=exhaustiveness)
+                vina_results['dock'] = docking_results
+        else:
+            vina_results = None
+        queue.put(('ok', vina_results))
+    except Exception as e:
+        queue.put(('err', repr(e)))
+
+
+def _run_docking_isolated(mol, docking_mode, ligand_filename, protein_root, protein_filename, exhaustiveness):
+    # Linux default: fork is lightweight and avoids repeated interpreter cold start.
+    ctx = mp.get_context('fork')
+    queue = ctx.Queue(maxsize=1)
+    payload = {
+        'mol_block': Chem.MolToMolBlock(mol),
+        'docking_mode': docking_mode,
+        'ligand_filename': ligand_filename,
+        'protein_root': protein_root,
+        'protein_filename': protein_filename,
+        'exhaustiveness': exhaustiveness,
+    }
+    proc = ctx.Process(target=_docking_worker, args=(payload, queue))
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f'docking subprocess crashed (exit_code={proc.exitcode})')
+    if queue.empty():
+        raise RuntimeError('docking subprocess returned no result')
+    status, value = queue.get()
+    if status == 'ok':
+        return value
+    raise RuntimeError(f'docking subprocess error: {value}')
 
 
 def print_dict(d, logger):
@@ -38,7 +98,7 @@ def print_ring_ratio(all_ring_sizes, logger):
 
 def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mode='none',
                    protein_root='./data/crossdocked_v1.1_rmsd1.0', atom_enc_mode='add_aromatic',
-                   verbose=False, save=True, exhaustiveness=16, logger=None):
+                   verbose=False, save=True, exhaustiveness=16, docking_isolate_process=False, logger=None):
     """
     Run full evaluation on generated samples in sample_path. Returns a flat dict of metrics
     suitable for logging (e.g. wandb). Can be called from train_diffusion for periodic eval.
@@ -110,23 +170,35 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
                     if ligand_filename is None and protein_filename is None:
                         data_keys = list(data.keys()) if isinstance(data, dict) else [k for k in dir(data) if not k.startswith('_')]
                         raise ValueError(f"data must have ligand_filename or protein_filename for docking. data keys: {data_keys[:20]}")
-                    vina_task = QVinaDockingTask.from_generated_mol(
-                        mol, ligand_filename=ligand_filename, protein_root=protein_root,
-                        protein_filename=protein_filename)
-                    vina_results = vina_task.run_sync()
+                    if docking_isolate_process:
+                        vina_results = _run_docking_isolated(
+                            mol=mol, docking_mode=docking_mode, ligand_filename=ligand_filename,
+                            protein_root=protein_root, protein_filename=protein_filename, exhaustiveness=exhaustiveness
+                        )
+                    else:
+                        vina_task = QVinaDockingTask.from_generated_mol(
+                            mol, ligand_filename=ligand_filename, protein_root=protein_root,
+                            protein_filename=protein_filename)
+                        vina_results = vina_task.run_sync()
                 elif docking_mode in ['vina_score', 'vina_dock']:
                     if ligand_filename is None and protein_filename is None:
                         data_keys = list(data.keys()) if isinstance(data, dict) else [k for k in dir(data) if not k.startswith('_')]
                         raise ValueError(f"data must have ligand_filename or protein_filename for docking. data keys: {data_keys[:20]}")
-                    vina_task = VinaDockingTask.from_generated_mol(
-                        mol, ligand_filename=ligand_filename, protein_root=protein_root,
-                        protein_filename=protein_filename)
-                    score_only_results = vina_task.run(mode='score_only', exhaustiveness=exhaustiveness)
-                    minimize_results = vina_task.run(mode='minimize', exhaustiveness=exhaustiveness)
-                    vina_results = {'score_only': score_only_results, 'minimize': minimize_results}
-                    if docking_mode == 'vina_dock':
-                        docking_results = vina_task.run(mode='dock', exhaustiveness=exhaustiveness)
-                        vina_results['dock'] = docking_results
+                    if docking_isolate_process:
+                        vina_results = _run_docking_isolated(
+                            mol=mol, docking_mode=docking_mode, ligand_filename=ligand_filename,
+                            protein_root=protein_root, protein_filename=protein_filename, exhaustiveness=exhaustiveness
+                        )
+                    else:
+                        vina_task = VinaDockingTask.from_generated_mol(
+                            mol, ligand_filename=ligand_filename, protein_root=protein_root,
+                            protein_filename=protein_filename)
+                        score_only_results = vina_task.run(mode='score_only', exhaustiveness=exhaustiveness)
+                        minimize_results = vina_task.run(mode='minimize', exhaustiveness=exhaustiveness)
+                        vina_results = {'score_only': score_only_results, 'minimize': minimize_results}
+                        if docking_mode == 'vina_dock':
+                            docking_results = vina_task.run(mode='dock', exhaustiveness=exhaustiveness)
+                            vina_results['dock'] = docking_results
                 else:
                     vina_results = None
                 n_eval_success += 1
@@ -376,6 +448,8 @@ if __name__ == '__main__':
     parser.add_argument('--atom_enc_mode', type=str, default='add_aromatic')
     parser.add_argument('--docking_mode', type=str, default='none', choices=['qvina', 'vina_score', 'vina_dock', 'none'])
     parser.add_argument('--exhaustiveness', type=int, default=16)
+    parser.add_argument('--docking_isolate_process', type=eval, default=False,
+                        help='Run each docking in a child process to avoid whole-run abort from native library crashes.')
     parser.add_argument('--one_line', action='store_true', help='Print all metrics in one line at the end (no ring size)')
     args = parser.parse_args()
 
@@ -393,6 +467,7 @@ if __name__ == '__main__':
         verbose=args.verbose,
         save=args.save,
         exhaustiveness=args.exhaustiveness,
+        docking_isolate_process=args.docking_isolate_process,
         logger=logger,
     )
     report_evaluation_to_logger(out, results, args.docking_mode, logger, one_line=args.one_line)
