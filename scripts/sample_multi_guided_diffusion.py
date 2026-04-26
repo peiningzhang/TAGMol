@@ -38,7 +38,10 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 
 def sample_guided_diffusion_ligand(model, guide_models, guide_configs, data, num_samples, batch_size=16, device='cuda:0',
                             num_steps=None, pos_only=False, center_pos_mode='protein',
-                            sample_num_atoms='prior'):
+                            sample_num_atoms='prior',
+                            noise_injection=True, noise_injection_rate=0.4,
+                            noise_injection_high_threshold=3.0,
+                            noise_injection_low_threshold=0.0):
     model.eval()
     for guide_model in guide_models:
         guide_model.eval()
@@ -94,7 +97,11 @@ def sample_guided_diffusion_ligand(model, guide_models, guide_configs, data, num
                 batch_ligand=batch_ligand,
                 num_steps=num_steps,
                 pos_only=pos_only,
-                center_pos_mode=center_pos_mode
+                center_pos_mode=center_pos_mode,
+                noise_injection=noise_injection,
+                noise_injection_rate=noise_injection_rate,
+                noise_injection_high_threshold=noise_injection_high_threshold,
+                noise_injection_low_threshold=noise_injection_low_threshold,
             )
             ligand_pos, ligand_v, ligand_pos_traj, ligand_v_traj = r['pos'], r['v'], r['pos_traj'], r['v_traj']
             ligand_v0_traj, ligand_vt_traj, ligand_pos0_traj = r['v0_traj'], r['vt_traj'], r['pos0_traj']

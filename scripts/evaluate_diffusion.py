@@ -282,9 +282,16 @@ def run_evaluation(sample_path, eval_step=-1, eval_num_examples=None, docking_mo
             out['Vina_min_med'] = float(np.median(vina_min))
         else:
             out['Vina_score_mean'] = out['Vina_score_med'] = out['Vina_min_mean'] = out['Vina_min_med'] = None
+        if results and docking_mode == 'vina_dock':
+            vina_dock_aff = [r['vina']['dock'][0]['affinity'] for r in results]
+            out['Vina_dock_mean'] = float(np.mean(vina_dock_aff))
+            out['Vina_dock_med'] = float(np.median(vina_dock_aff))
+        else:
+            out['Vina_dock_mean'] = out['Vina_dock_med'] = None
     except Exception as e:
         logger.warning(f"Error calculating Vina metrics: {e}")
         out['Vina_score_mean'] = out['Vina_score_med'] = out['Vina_min_mean'] = out['Vina_min_med'] = None
+        out['Vina_dock_mean'] = out['Vina_dock_med'] = None
 
     # Per-pocket: mean pairwise RDK Tanimoto among generated mols; Diversity = 1 - that mean (macro avg over pockets).
     try:
@@ -378,6 +385,9 @@ def metrics_one_line_tsv_parts(out, results, docking_mode):
                 _fmt(np.median(vina_min)),
             ]
         )
+        if docking_mode == 'vina_dock':
+            names.extend(['Vina_dock_mean', 'Vina_dock_med'])
+            values.extend([_fmt(out.get('Vina_dock_mean')), _fmt(out.get('Vina_dock_med'))])
     sep = '\t '
     return sep.join(names), sep.join(values)
 

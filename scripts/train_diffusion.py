@@ -247,6 +247,10 @@ if __name__ == '__main__':
             float(getattr(config.model, 'condition_dropout_qed', 0.0)),
             float(getattr(config.model, 'condition_dropout_sa', 0.0)),
         )
+        logger.info(
+            'Condition perturbation mode: perturb_condition_only=%s',
+            str(bool(getattr(config.model, 'perturb_condition_only', False))),
+        )
 
     # Optimizer and scheduler
     optimizer = utils_train.get_optimizer(config.train.optimizer, model)
@@ -319,6 +323,11 @@ if __name__ == '__main__':
                 vina_bin=getattr(batch, 'vina_bin', None),
                 qed_bin=getattr(batch, 'qed_bin', None),
                 sa_bin=getattr(batch, 'sa_bin', None),
+                pocket_noise_mode=getattr(config.train, 'pocket_noise_mode', 'fixed'),
+                pos_noise_std=float(getattr(config.train, 'pos_noise_std', 0.0)),
+                pocket_noise_sigma_coeff=float(getattr(config.train, 'pocket_noise_sigma_coeff', 0.0)),
+                pocket_noise_max=float(getattr(config.train, 'pocket_noise_max', 0.0)),
+                perturb_condition_only=bool(getattr(config.model, 'perturb_condition_only', False)),
             )
             loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
             loss_bond = results.get('loss_bond', torch.tensor(0.))
@@ -393,6 +402,11 @@ if __name__ == '__main__':
                         vina_bin=getattr(batch, 'vina_bin', None),
                         qed_bin=getattr(batch, 'qed_bin', None),
                         sa_bin=getattr(batch, 'sa_bin', None),
+                        pocket_noise_mode=getattr(config.train, 'pocket_noise_mode', 'fixed'),
+                        pos_noise_std=float(getattr(config.train, 'pos_noise_std', 0.0)),
+                        pocket_noise_sigma_coeff=float(getattr(config.train, 'pocket_noise_sigma_coeff', 0.0)),
+                        pocket_noise_max=float(getattr(config.train, 'pocket_noise_max', 0.0)),
+                        perturb_condition_only=bool(getattr(config.model, 'perturb_condition_only', False)),
                     )
                     loss, loss_pos, loss_v = results['loss'], results['loss_pos'], results['loss_v']
                     loss_bond = results.get('loss_bond', torch.tensor(0.))

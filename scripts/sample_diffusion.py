@@ -30,7 +30,10 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 
 def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cuda:0',
                             num_steps=None, pos_only=False, center_pos_mode='protein',
-                            sample_num_atoms='prior', cfg_scale=0.0, cfg_strategy='always'):
+                            sample_num_atoms='prior', cfg_scale=0.0, cfg_strategy='always',
+                            noise_injection=True, noise_injection_rate=0.4,
+                            noise_injection_high_threshold=3.0,
+                            noise_injection_low_threshold=0.0):
     all_pred_pos, all_pred_v = [], []
     all_pred_pos_traj, all_pred_pos0_traj, all_pred_v_traj = [], [], []
     all_pred_v0_traj, all_pred_vt_traj = [], []
@@ -85,6 +88,10 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
                 vina_bin=getattr(batch, 'vina_bin', None),
                 qed_bin=getattr(batch, 'qed_bin', None),
                 sa_bin=getattr(batch, 'sa_bin', None),
+                noise_injection=noise_injection,
+                noise_injection_rate=noise_injection_rate,
+                noise_injection_high_threshold=noise_injection_high_threshold,
+                noise_injection_low_threshold=noise_injection_low_threshold,
             )
             ligand_pos, ligand_v, ligand_pos_traj, ligand_v_traj = r['pos'], r['v'], r['pos_traj'], r['v_traj']
             ligand_v0_traj, ligand_vt_traj, ligand_pos0_traj = r['v0_traj'], r['vt_traj'], r['pos0_traj']

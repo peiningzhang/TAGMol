@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import tempfile
 from collections import defaultdict
 from datetime import datetime
@@ -218,6 +219,12 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to trained checkpoint (.pt).')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use for sampling.')
     parser.add_argument('--num_proteins', type=int, default=5, help='Number of protein pockets to evaluate (from test split).')
+    parser.add_argument(
+        '--start_protein_idx',
+        type=int,
+        default=0,
+        help='Start index in test split for protein pockets to evaluate.',
+    )
     parser.add_argument('--num_ligands_per_protein', type=int, default=10, help='Number of ligands to sample per protein.')
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size for sampling.')
     parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale for conditioned models; 0.0 = unconditional (no CFG blend), >0 enables CFG.')
@@ -229,6 +236,11 @@ def main():
                              'only enable it once sigma drops below the midpoint, letting the model '
                              'first find rough structure unconditionally.')
     parser.add_argument('--tmp_root', type=str, default='./tmp_eval', help='Root directory to create temporary evaluation folders.')
+    parser.add_argument(
+        '--sample_only',
+        action='store_true',
+        help='Only run sampling; save result_*.pt under the temp directory and exit (no evaluate_diffusion, SDF export, or GenBench).',
+    )
     parser.add_argument('--eval_step', type=int, default=-1, help='Which diffusion step to evaluate (passed to evaluate_diffusion.py).')
     parser.add_argument('--docking_mode', type=str, default='none', choices=['qvina', 'vina_score', 'vina_dock', 'none'], help='Docking mode passed to evaluate_diffusion.py.')
     parser.add_argument(
@@ -252,6 +264,29 @@ def main():
     parser.add_argument('--guide_kind', type=int, default=2, help='Prior kind to guide to (default=2 i.e., Kd).')
     parser.add_argument('--time_scheduler', type=str, default=None, help='Time scheduler to use, overriding config.')
     parser.add_argument('--num_steps', type=int, default=None, help='Number of diffusion steps for sampling, overriding config.')
+    parser.add_argument(
+        '--no_veda_noise_injection',
+        action='store_true',
+        help='Disable VEDA sampling extra noise injection (pos/type/bond remasking). Default: injection enabled.',
+    )
+    parser.add_argument(
+        '--veda_noise_injection_rate',
+        type=float,
+        default=0.4,
+        help='VEDA noise injection: scale factor applied to sigma before remasking (default: 0.4).',
+    )
+    parser.add_argument(
+        '--veda_noise_injection_high_threshold',
+        type=float,
+        default=3.0,
+        help='VEDA noise injection: only when all batch sigmas are below this value (default: 3).',
+    )
+    parser.add_argument(
+        '--veda_noise_injection_low_threshold',
+        type=float,
+        default=0.0,
+        help='VEDA noise injection: only when all batch sigmas are above this value (default: 0).',
+    )
     parser.add_argument('--sample_config', type=str, default=None, help='Path to a yaml that defines guide_models (checkpoint, weight, gradient_scale_cord, gradient_scale_categ). Overrides --guide_checkpoints and related args.')
     # Optional: grouped SDF export + GenBench3D (off by default)
     parser.add_argument(
@@ -301,6 +336,8 @@ def main():
 
     if args.run_genbench and not args.gb3d_dir:
         parser.error('--run_genbench requires --gb3d_dir')
+    if args.sample_only and (args.export_grouped_sdf or args.run_genbench):
+        parser.error('--sample_only cannot be used with --export_grouped_sdf or --run_genbench (evaluation is skipped).')
 
     # Load global config (data split, seeds, etc.)
     config = misc.load_config(args.config)
@@ -343,10 +380,18 @@ def main():
     test_set = subsets["test"]
     logger.info(f"Test set size: {len(test_set)}")
 
-    num_proteins = min(args.num_proteins, len(test_set))
+    if args.start_protein_idx < 0:
+        parser.error('--start_protein_idx must be >= 0')
+    if args.start_protein_idx >= len(test_set):
+        parser.error(
+            f'--start_protein_idx ({args.start_protein_idx}) must be smaller than test set size ({len(test_set)})'
+        )
+    end_protein_idx = min(args.start_protein_idx + args.num_proteins, len(test_set))
+    protein_indices = range(args.start_protein_idx, end_protein_idx)
+    num_proteins = len(protein_indices)
     logger.info(
-        f"Will evaluate on first {num_proteins} proteins, "
-        f"{args.num_ligands_per_protein} ligands per protein."
+        f"Will evaluate proteins in test index range [{args.start_protein_idx}, {end_protein_idx}) "
+        f"(count={num_proteins}), {args.num_ligands_per_protein} ligands per protein."
     )
 
     # Initialise the generation model
@@ -373,6 +418,13 @@ def main():
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     logger.info(f"Loaded model from checkpoint: {args.checkpoint}")
+    veda_noise_kwargs = {
+        "noise_injection": not args.no_veda_noise_injection,
+        "noise_injection_rate": args.veda_noise_injection_rate,
+        "noise_injection_high_threshold": args.veda_noise_injection_high_threshold,
+        "noise_injection_low_threshold": args.veda_noise_injection_low_threshold,
+    }
+    logger.info("VEDA noise injection: %s", veda_noise_kwargs)
     use_condition = getattr(ckpt_cfg.model, "use_condition", False)
     if use_condition:
         logger.info(
@@ -430,7 +482,8 @@ def main():
     # ---------------------------------------------------------------------
     # Sampling loop per protein
     # ---------------------------------------------------------------------
-    for data_id in range(num_proteins):
+    sampling_sec_per_protein = []
+    for data_id in protein_indices:
         data = test_set[data_id]
         logger.info(f"Sampling for protein index {data_id}...")
 
@@ -441,6 +494,7 @@ def main():
             data.qed_bin = torch.tensor(best_bin, dtype=torch.long)
             data.sa_bin = torch.tensor(best_bin, dtype=torch.long)
 
+        t_sample_start = time.perf_counter()
         if guide_models is not None:
             # Multi‑guide diffusion
             (
@@ -464,6 +518,7 @@ def main():
                 pos_only=False,
                 center_pos_mode=ckpt_cfg.model.center_pos_mode,
                 sample_num_atoms='prior',
+                **veda_noise_kwargs,
             )
         else:
             # Fallback to original single‑guide diffusion
@@ -488,7 +543,17 @@ def main():
                 sample_num_atoms='prior',
                 cfg_scale=args.cfg_scale,
                 cfg_strategy=args.cfg_strategy,
+                **veda_noise_kwargs,
             )
+        sample_dt = time.perf_counter() - t_sample_start
+        sampling_sec_per_protein.append((data_id, sample_dt))
+        n_lig = max(args.num_ligands_per_protein, 1)
+        logger.info(
+            "Sampling time (protein index %d): %.4f s total, %.4f s per ligand (wall clock)",
+            data_id,
+            sample_dt,
+            sample_dt / n_lig,
+        )
 
         result = {
             'data': data,
@@ -508,6 +573,46 @@ def main():
         out_path = os.path.join(tmp_dir, f"result_{data_id}.pt")
         torch.save(result, out_path)
         logger.info(f"Saved sampling result to: {out_path}")
+
+    if sampling_sec_per_protein:
+        dts = [dt for _, dt in sampling_sec_per_protein]
+        total_s = sum(dts)
+        n_p = len(sampling_sec_per_protein)
+        n_lig_total = n_p * max(args.num_ligands_per_protein, 1)
+        mean_per_p = total_s / n_p
+        timing_payload = {
+            "seconds_per_protein": [
+                {"data_id": int(did), "seconds": float(dt)} for did, dt in sampling_sec_per_protein
+            ],
+            "summary": {
+                "total_seconds": float(total_s),
+                "num_proteins": n_p,
+                "num_ligands_per_protein": args.num_ligands_per_protein,
+                "total_ligands": n_lig_total,
+                "mean_seconds_per_protein": float(mean_per_p),
+                "min_seconds_per_protein": float(min(dts)),
+                "max_seconds_per_protein": float(max(dts)),
+                "mean_seconds_per_ligand": float(total_s / n_lig_total),
+            },
+        }
+        timing_path = os.path.join(tmp_dir, "sampling_timing.json")
+        with open(timing_path, "w") as tf:
+            json.dump(timing_payload, tf, indent=2)
+        logger.info(
+            "Sampling timing: total=%.4f s | proteins=%d | mean per protein=%.4f s | min=%.4f s | max=%.4f s | "
+            "mean per ligand=%.4f s | wrote %s",
+            total_s,
+            n_p,
+            mean_per_p,
+            min(dts),
+            max(dts),
+            total_s / n_lig_total,
+            timing_path,
+        )
+
+    if args.sample_only:
+        logger.info("Sample-only run finished; skipped evaluate_diffusion. Output directory: %s", tmp_dir)
+        return
 
     # ---------------------------------------------------------------------
     # Run evaluation script on the generated samples

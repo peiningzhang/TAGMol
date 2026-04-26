@@ -50,10 +50,11 @@ model:
   sample_time_method: symmetric  # ['importance', 'symmetric']
   use_condition: true           # Optional: scalar property bins (vina / qed / sa)
   # Training dropout (see molopt_score_model._build_condition_feature): global first, then independent.
-  condition_dropout: 0.4        # Per-graph P(null all three) — full CFG-style unconditional
-  condition_dropout_vina: 0.15   # If global did not fire: per-graph P(null vina only)
-  condition_dropout_qed: 0.15    # same for qed
-  condition_dropout_sa: 0.15     # same for sa (0,0,0 recovers old “joint only” behavior)
+  condition_dropout: 0.5        # Per-graph P(null all three) — full CFG-style unconditional
+  condition_dropout_vina: 0.0   # If global did not fire: per-graph P(null vina only)
+  condition_dropout_qed: 0.0    # same for qed
+  condition_dropout_sa: 0.0     # same for sa (0,0,0 recovers old “joint only” behavior)
+  perturb_condition_only: false  # If true, only condition-retained graphs receive perturbation noise
   condition_bins: 5             # bins per property (excluding reserved null index)
   condition_emb_dim: 8          # per-property embedding dim before fusion
 
@@ -96,14 +97,14 @@ train:
   quick_eval_freq: 10000
   quick_eval_num_proteins: 10
   quick_eval_num_ligands_per_protein: 10
-  pos_noise_std: 0.1
+  pos_noise_std: 0.3
   # pocket noise vs ligand EDM sigma:
   # fixed = pos_noise_std only
   # sigma_scaled = clamp(sigma * coeff, max)
   # sigma_sqrt_scaled = clamp(sqrt(sigma) * coeff, max)
   pocket_noise_mode: sigma_scaled   # fixed | sigma_scaled | sigma_sqrt_scaled
-  pocket_noise_sigma_coeff: 0.1
-  pocket_noise_max: 0.5
+  pocket_noise_sigma_coeff: 0.2
+  pocket_noise_max: 1.0
   max_grad_norm: 8.0
   optimizer:
     type: muon

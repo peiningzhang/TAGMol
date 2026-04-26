@@ -288,6 +288,7 @@ class ScorePosNet3D(nn.Module):
             self.condition_dropout_sa = 0.0
         self.condition_bins = getattr(config, 'condition_bins', 5)
         self.condition_emb_dim = getattr(config, 'condition_emb_dim', 8)
+        self.perturb_condition_only = getattr(config, 'perturb_condition_only', False)
 
         self.sample_time_method = config.sample_time_method  # ['importance', 'symmetric']
         self.bond_input = getattr(config, 'bond_input', False)
@@ -496,36 +497,13 @@ class ScorePosNet3D(nn.Module):
         c_noise = torch.log(sigma.clamp(min=1e-12)) / 4
         return c_skip, c_out, c_in, c_noise
 
-    def _build_condition_feature(self, batch_ligand, vina_bin=None, qed_bin=None, sa_bin=None,
-                                 force_drop=False):
-        """Build per-atom condition features from per-graph bins.
+    def _apply_condition_dropout(self, vina_bin, qed_bin, sa_bin, null_idx, device, force_drop=False):
+        """Apply condition dropout on graph-level bins and return dropped bins.
 
-        The reserved `null` index is the unconditional embedding for each scalar
-        (vina / qed / sa). During training:
-
-        - With probability ``condition_dropout`` per graph, all three bins are set
-          to null (global unconditional).
-        - Otherwise, ``condition_dropout_{vina,qed,sa}`` each independently drop
-          only that scalar for the graph (partial conditional).
-
-        Setting the three independent rates to 0 recovers the old joint-only behavior.
+        Returns:
+            vina_bin, qed_bin, sa_bin: dropped bins.
+            has_any_condition: bool mask (num_graphs,), True if any condition remains.
         """
-        if not self.use_condition:
-            return None
-
-        device = batch_ligand.device
-        null_idx = self.condition_null_idx
-
-        if vina_bin is None or qed_bin is None or sa_bin is None:
-            num_graphs = int(batch_ligand.max().item()) + 1
-            vina_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
-            qed_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
-            sa_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
-        else:
-            vina_bin = vina_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
-            qed_bin = qed_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
-            sa_bin = sa_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
-
         if force_drop:
             vina_bin = torch.full_like(vina_bin, null_idx)
             qed_bin = torch.full_like(qed_bin, null_idx)
@@ -557,6 +535,44 @@ class ScorePosNet3D(nn.Module):
                 if self.condition_dropout_sa > 0:
                     m = torch.rand(n_g, device=device) < self.condition_dropout_sa
                     sa_bin[remain & m] = null_idx
+
+        has_any_condition = (vina_bin != null_idx) | (qed_bin != null_idx) | (sa_bin != null_idx)
+        return vina_bin, qed_bin, sa_bin, has_any_condition
+
+    def _build_condition_feature(self, batch_ligand, vina_bin=None, qed_bin=None, sa_bin=None,
+                                 force_drop=False, apply_training_dropout=True):
+        """Build per-atom condition features from per-graph bins.
+
+        The reserved `null` index is the unconditional embedding for each scalar
+        (vina / qed / sa). During training:
+
+        - With probability ``condition_dropout`` per graph, all three bins are set
+          to null (global unconditional).
+        - Otherwise, ``condition_dropout_{vina,qed,sa}`` each independently drop
+          only that scalar for the graph (partial conditional).
+
+        Setting the three independent rates to 0 recovers the old joint-only behavior.
+        """
+        if not self.use_condition:
+            return None
+
+        device = batch_ligand.device
+        null_idx = self.condition_null_idx
+
+        if vina_bin is None or qed_bin is None or sa_bin is None:
+            num_graphs = int(batch_ligand.max().item()) + 1
+            vina_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+            qed_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+            sa_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+        else:
+            vina_bin = vina_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+            qed_bin = qed_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+            sa_bin = sa_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+
+        if force_drop or apply_training_dropout:
+            vina_bin, qed_bin, sa_bin, _ = self._apply_condition_dropout(
+                vina_bin, qed_bin, sa_bin, null_idx, device, force_drop=force_drop
+            )
 
         cond_input = torch.cat([
             self.vina_bin_emb(vina_bin),
@@ -607,6 +623,17 @@ class ScorePosNet3D(nn.Module):
             time_points = np.exp(time_points).tolist()
             time_points.reverse()
             sigma = torch.tensor(time_points, device=device, dtype=torch.float32)
+        elif scheduler == 'gen_arcsin':
+            beta = 2.2
+            p = 0.57
+            tau = torch.linspace(1, 0, num_steps + 1, device=device)
+            gen_arc = 2 * torch.arcsin(torch.clamp(tau ** p, 0, 1)) / np.pi
+            u = (1 - beta) * tau + beta * gen_arc
+
+            sigma = torch.exp(
+                np.log(self.sigma_min)
+                + u * (np.log(self.sigma_max) - np.log(self.sigma_min))
+            )
         elif scheduler == 'edm1':
             # EDM1: rho = -1 EDM schedule, blended with arcsin schedule, same length/shape as others
             edm_rho = -1
@@ -640,7 +667,8 @@ class ScorePosNet3D(nn.Module):
     def forward(self, protein_pos, protein_v, batch_protein, init_ligand_pos, init_ligand_v, batch_ligand,
                 sigma=None, return_all=False, fix_x=False, guide=None,
                 init_ligand_bond_index=None, init_ligand_bond_type=None,
-                vina_bin=None, qed_bin=None, sa_bin=None, condition_force_drop=False):
+                vina_bin=None, qed_bin=None, sa_bin=None, condition_force_drop=False,
+                condition_apply_training_dropout=True):
         """_summary_
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -697,6 +725,7 @@ class ScorePosNet3D(nn.Module):
                 qed_bin=qed_bin,
                 sa_bin=sa_bin,
                 force_drop=condition_force_drop,
+                apply_training_dropout=condition_apply_training_dropout,
             )
             input_ligand_feat = torch.cat([input_ligand_feat, condition_feat], dim=-1)
 
@@ -937,7 +966,10 @@ class ScorePosNet3D(nn.Module):
     def get_diffusion_loss(
             self, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand,
             time_step=None, ligand_bond_index=None, ligand_bond_type=None, ligand_bond_type_batch=None,
-            vina_bin=None, qed_bin=None, sa_bin=None
+            vina_bin=None, qed_bin=None, sa_bin=None,
+            pocket_noise_mode='fixed', pos_noise_std=0.0,
+            pocket_noise_sigma_coeff=0.0, pocket_noise_max=0.0,
+            perturb_condition_only=False
     ):
         num_graphs = batch_protein.max().item() + 1
         protein_pos, ligand_pos, _ = center_pos_rescale(
@@ -969,6 +1001,44 @@ class ScorePosNet3D(nn.Module):
                     print(f"[TRIAL] Sampled sigma (val): {sigma.detach().cpu().numpy()}")
                 # Map timestep to t: linear from 0 to t_max
             sigma_per_atom = sigma[batch_ligand].unsqueeze(-1)
+
+            cond_vina_bin, cond_qed_bin, cond_sa_bin = vina_bin, qed_bin, sa_bin
+            condition_apply_training_dropout = True
+
+            # Optional pocket noise on protein coordinates (independent from ligand sigma noising).
+            if pocket_noise_mode == 'fixed':
+                pocket_noise_graph = torch.full_like(sigma, float(pos_noise_std))
+            elif pocket_noise_mode == 'sigma_scaled':
+                pocket_noise_graph = (sigma * float(pocket_noise_sigma_coeff)).clamp(max=float(pocket_noise_max))
+            elif pocket_noise_mode == 'sigma_sqrt_scaled':
+                pocket_noise_graph = (sigma.clamp(min=0.0).sqrt() * float(pocket_noise_sigma_coeff)).clamp(
+                    max=float(pocket_noise_max)
+                )
+            else:
+                raise ValueError(f'Unknown pocket_noise_mode: {pocket_noise_mode}')
+
+            if (
+                self.use_condition
+                and perturb_condition_only
+                and pocket_noise_mode in ('sigma_scaled', 'sigma_sqrt_scaled')
+            ):
+                null_idx = self.condition_null_idx
+                if cond_vina_bin is None or cond_qed_bin is None or cond_sa_bin is None:
+                    cond_vina_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+                    cond_qed_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+                    cond_sa_bin = torch.full((num_graphs,), null_idx, dtype=torch.long, device=device)
+                else:
+                    cond_vina_bin = cond_vina_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+                    cond_qed_bin = cond_qed_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+                    cond_sa_bin = cond_sa_bin.to(device).long().view(-1).clamp(min=0, max=self.condition_bins - 1)
+                cond_vina_bin, cond_qed_bin, cond_sa_bin, graph_has_condition = self._apply_condition_dropout(
+                    cond_vina_bin, cond_qed_bin, cond_sa_bin, null_idx, device, force_drop=False
+                )
+                pocket_noise_graph = pocket_noise_graph * graph_has_condition.float()
+                condition_apply_training_dropout = False
+
+            pocket_noise_std_atom = pocket_noise_graph[batch_protein].unsqueeze(-1)
+            protein_pos_noisy = protein_pos + torch.randn_like(protein_pos, device=device) * pocket_noise_std_atom
 
             # EDM pos noising: pos_t = pos_0 + sigma * eps
             pos_noise = torch.randn_like(ligand_pos, device=device)
@@ -1009,7 +1079,7 @@ class ScorePosNet3D(nn.Module):
             _, c_out, _, _ = self.get_edm_scaling(sigma_per_atom)
             # Forward with sigma, noisy atom types AND noisy bond stats
             preds = self(
-                protein_pos=protein_pos,
+                protein_pos=protein_pos_noisy,
                 protein_v=protein_v,
                 batch_protein=batch_protein,
                 init_ligand_pos=ligand_pos_perturbed,
@@ -1018,18 +1088,21 @@ class ScorePosNet3D(nn.Module):
                 sigma=sigma_per_atom,
                 init_ligand_bond_index=noisy_bond_index,
                 init_ligand_bond_type=noisy_bond_type,
-                vina_bin=vina_bin,
-                qed_bin=qed_bin,
-                sa_bin=sa_bin,
+                vina_bin=cond_vina_bin,
+                qed_bin=cond_qed_bin,
+                sa_bin=cond_sa_bin,
+                condition_apply_training_dropout=condition_apply_training_dropout,
             )
             pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
             error = pred_ligand_pos - ligand_pos
-            loss_pos = scatter_mean(((error ** 2)/(c_out**2)).sum(-1), batch_ligand, dim=0).mean()
+            c_out_safe = c_out.clamp(min=1e-12)
+            pos_atom_loss = ((error ** 2) / (c_out_safe ** 2)).sum(-1)
+            loss_pos = scatter_mean(pos_atom_loss, batch_ligand, dim=0).mean()
 
             # Discrete FM loss: CrossEntropy(pred_logits, v_0)
-            loss_v = F.cross_entropy(pred_ligand_v, ligand_v, reduction='none')
-            loss_v = scatter_mean(loss_v, batch_ligand, dim=0).mean()
+            loss_v_atom = F.cross_entropy(pred_ligand_v, ligand_v, reduction='none')
+            loss_v = scatter_mean(loss_v_atom, batch_ligand, dim=0).mean()
 
             loss = self.loss_pos_weight * loss_pos + self.loss_v_weight * loss_v
 
@@ -1385,7 +1458,10 @@ class ScorePosNet3D(nn.Module):
                          init_ligand_pos, init_ligand_v, batch_ligand,
                          num_steps=None, center_pos_mode=None, pos_only=False,
                          cfg_scale=0.0, vina_bin=None, qed_bin=None, sa_bin=None,
-                         cfg_strategy='always'):
+                         cfg_strategy='always',
+                         noise_injection=True, noise_injection_rate=0.4,
+                         noise_injection_high_threshold=3.0,
+                         noise_injection_low_threshold=0.0):
         """ Denoise the init_ligand_pos and init_ligand_v.
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
 
@@ -1444,10 +1520,6 @@ class ScorePosNet3D(nn.Module):
             # Sampling: Reverse direction, from noise (t=t_max) to clean (t=0)
             S = self.num_classes
             eps = 1e-5
-            noise_injection = True
-            noise_injection_rate = 0.4
-            noise_injection_high_threshold = 3
-            noise_injection_low_threshold = 0
             cfg_scale_max = cfg_scale
             for step in tqdm(range(n_dfm), desc='sampling', total=n_dfm):
                 sigma_i = sigma_schedule[step].expand(num_graphs).unsqueeze(-1)
@@ -1629,7 +1701,10 @@ class ScorePosNet3D(nn.Module):
     
     def sample_guided_diffusion(self, guide_model, gradient_scale_cord, gradient_scale_categ, kind, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
-                         num_steps=None, center_pos_mode=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None):
+                         num_steps=None, center_pos_mode=None, pos_only=False, clamp_pred_min=None, clamp_pred_max=None,
+                         noise_injection=True, noise_injection_rate=0.4,
+                         noise_injection_high_threshold=3.0,
+                         noise_injection_low_threshold=0.0):
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + DFM (v) with classifier guidance via sigma ===
             num_steps = self.num_timesteps
@@ -1640,10 +1715,6 @@ class ScorePosNet3D(nn.Module):
             sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
             S = self.num_classes
             eps = 1e-5
-            noise_injection = True
-            noise_injection_rate = 0.4
-            noise_injection_high_threshold = 3
-            noise_injection_low_threshold = 0
             protein_pos, init_ligand_pos, offset = center_pos_rescale(
                 protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
 
@@ -1821,7 +1892,10 @@ class ScorePosNet3D(nn.Module):
 
     def sample_multi_guided_diffusion(self, guide_models, guide_configs, n_data, device, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
-                         num_steps=None, center_pos_mode=None, pos_only=False):
+                         num_steps=None, center_pos_mode=None, pos_only=False,
+                         noise_injection=True, noise_injection_rate=0.4,
+                         noise_injection_high_threshold=3.0,
+                         noise_injection_low_threshold=0.0):
         assert len(guide_models) == len(guide_configs), f"guide_models and guide_configs must have the same length"
         if self.diffusion_type == 'veda':
             # === VEDA: EDM (pos) + DFM (v) with multi-classifier guidance via sigma ===
@@ -1833,10 +1907,6 @@ class ScorePosNet3D(nn.Module):
             sigma_schedule = self.get_sigma_schedule(n_dfm, device, time_scheduler)
             S = self.num_classes
             eps = 1e-5
-            noise_injection = True
-            noise_injection_rate = 0.4
-            noise_injection_high_threshold = 3
-            noise_injection_low_threshold = 0
 
             protein_pos, init_ligand_pos, offset = center_pos_rescale(
                 protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode, rescale_factor=self.rescale_factor)
