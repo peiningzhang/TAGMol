@@ -40,6 +40,8 @@ model:
   v_beta_s: 0.01
   num_diffusion_timesteps: 100
   loss_pos_weight: 3.0
+  # VEDA position loss: EDM uses sum_dims (error^2 / c_out^2); set false to use plain ||error||^2
+  loss_pos_divide_by_c_out_sq: true
   loss_v_weight: 3.
   bond_loss: false
   bond_input: false

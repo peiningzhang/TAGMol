@@ -66,10 +66,19 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_resume', type=str, default=None, 
                        choices=['allow', 'must', 'never'], 
                        help='Wandb resume mode: allow (resume if exists), must (require resume), never (always new)')
+    parser.add_argument(
+        '--no_loss_pos_c_out_sq',
+        action='store_true',
+        help='VEDA: disable 1/c_out^2 weighting on position loss (sets model.loss_pos_divide_by_c_out_sq=false)',
+    )
     args = parser.parse_args()
 
     # Load configs
     config = misc.load_config(args.config)
+    if args.no_loss_pos_c_out_sq:
+        if not hasattr(config, 'model'):
+            raise ValueError('config must have a model section for --no_loss_pos_c_out_sq')
+        config.model.loss_pos_divide_by_c_out_sq = False
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     misc.seed_all(config.train.seed)
 

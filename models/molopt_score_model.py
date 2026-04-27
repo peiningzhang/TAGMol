@@ -1,4 +1,5 @@
 import inspect
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -263,6 +264,8 @@ class ScorePosNet3D(nn.Module):
         self.model_mean_type = config.model_mean_type  # ['noise', 'C0']
         self.loss_v_weight = config.loss_v_weight
         self.loss_pos_weight = config.loss_pos_weight if hasattr(config, 'loss_pos_weight') else 1.0
+        # VEDA: EDM paper weights position MSE by 1/c_out^2; set False for unweighted per-dimension MSE
+        self.loss_pos_divide_by_c_out_sq = getattr(config, 'loss_pos_divide_by_c_out_sq', True)
         # Bond loss hyperparams
         self.bond_loss = getattr(config, 'bond_loss', False)
         self.loss_bond_weight = getattr(config, 'loss_bond_weight', 1.0)
@@ -1096,8 +1099,11 @@ class ScorePosNet3D(nn.Module):
             pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
 
             error = pred_ligand_pos - ligand_pos
-            c_out_safe = c_out.clamp(min=1e-12)
-            pos_atom_loss = ((error ** 2) / (c_out_safe ** 2)).sum(-1)
+            if self.loss_pos_divide_by_c_out_sq:
+                c_out_safe = c_out.clamp(min=1e-12)
+                pos_atom_loss = ((error ** 2) / (c_out_safe ** 2)).sum(-1)
+            else:
+                pos_atom_loss = (error ** 2).sum(-1)
             loss_pos = scatter_mean(pos_atom_loss, batch_ligand, dim=0).mean()
 
             # Discrete FM loss: CrossEntropy(pred_logits, v_0)
@@ -1596,7 +1602,14 @@ class ScorePosNet3D(nn.Module):
                     cfg_scale = (step / n_dfm) * cfg_scale_max
                 else:
                     cfg_scale = cfg_scale_max
-                if self.use_condition and cfg_scale != 0.0 and (vina_bin is not None or qed_bin is not None or sa_bin is not None):
+                # s=1: u + 1*(c-u) = c — skip unconditional forward (same result, fewer FLOPs).
+                if (
+                    self.use_condition
+                    and math.isclose(cfg_scale, 1.0, rel_tol=0.0, abs_tol=1e-5)
+                    and (vina_bin is not None or qed_bin is not None or sa_bin is not None)
+                ):
+                    preds = _run_forward(condition_force_drop=False)
+                elif self.use_condition and cfg_scale != 0.0 and (vina_bin is not None or qed_bin is not None or sa_bin is not None):
                     preds_cond = _run_forward(condition_force_drop=False)
                     preds_uncond = _run_forward(condition_force_drop=True)
                     preds = {
