@@ -100,7 +100,7 @@ def _vina_affinity(vina, branch, mode="first"):
     return None
 
 
-def aggregate_like_evaluate(rows):
+def aggregate_like_evaluate(rows, include_chem_without_vina=False):
     num_samples = len(rows)
     all_mol_stable = all_atom_stable = all_n_atom = 0
     n_recon_success = n_eval_success = n_complete = 0
@@ -133,7 +133,9 @@ def aggregate_like_evaluate(rows):
             n_complete += 1
 
         vina = row.get("vina")
-        if vina is None or mol is None:
+        if mol is None:
+            continue
+        if vina is None and not include_chem_without_vina:
             continue
         n_eval_success += 1
         try:
@@ -151,7 +153,7 @@ def aggregate_like_evaluate(rows):
                 {
                     "mol": mol,
                     "chem_results": chem,
-                    "vina": vina,
+                    "vina": vina if vina is not None else {},
                     "ligand_filename": row.get("ligand_filename"),
                     "protein_filename": row.get("protein_filename"),
                 }
@@ -274,6 +276,15 @@ def main():
         default=None,
         help="Output TSV path (default: same dir as .pt, stem + _evaluate_like.tsv)",
     )
+    ap.add_argument(
+        "--include-chem-without-vina",
+        action="store_true",
+        help=(
+            "Include bond-length / pair-distance / QED / SA / diversity rows even when "
+            "vina is missing (Vina columns in TSV stay empty). For PocketXMol flat SDF "
+            "exports without docking dicts."
+        ),
+    )
     args = ap.parse_args()
     pt_path = os.path.abspath(args.pt)
     if not os.path.isfile(pt_path):
@@ -281,7 +292,9 @@ def main():
 
     raw = torch.load(pt_path, map_location="cpu")
     rows = _normalize_results(raw)
-    out = aggregate_like_evaluate(rows)
+    out = aggregate_like_evaluate(
+        rows, include_chem_without_vina=args.include_chem_without_vina
+    )
 
     out_path = args.out
     if not out_path:

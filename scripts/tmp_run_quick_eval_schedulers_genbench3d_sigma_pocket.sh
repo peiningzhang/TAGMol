@@ -6,17 +6,18 @@
             # --cfg_strategy "ramp_up" \
             # CFG_SCALES=(0 0.5 1.0 2.0 3.0 5.0)
 SCHEDULERS=("gen_arcsin")
-CFG_SCALES=(0 0.5 1.0 2.0 3.0 5.0 10.0 15.0 20.0)
+sigma_pocket_scales=(0 0.1 0.3 0.5 1.0)
 for SCHED in "${SCHEDULERS[@]}"
 do
-    for CFG in "${CFG_SCALES[@]}"
+    for sigma_pocket in "${sigma_pocket_scales[@]}"
     do
         echo "=========================================================="
-        echo "Running quick_evaluate: time_scheduler=$SCHED cfg_scale=$CFG"
+        echo "Running quick_evaluate: time_scheduler=$SCHED sigma_pocket=$sigma_pocket"
         echo "=========================================================="
+        # fixed cfg_scale for this sweep; do not put comments after trailing '\' (breaks bash line continuation)
         python scripts/quick_evaluate.py \
-            --config logs_diffusion/training_cfg_muon_2026_04_29__16_22_09/sampling.yml \
-            --checkpoint logs_diffusion/training_cfg_muon_2026_04_29__16_22_09/checkpoints/366000.pt \
+            --config logs_diffusion/training_cfg_muon_2026_04_20__16_14_01/sampling.yml \
+            --checkpoint logs_diffusion/training_cfg_muon_2026_04_20__16_14_01/checkpoints/354000.pt \
             --num_proteins 100 \
             --num_ligands_per_protein 10 \
             --docking_mode vina_score \
@@ -27,8 +28,9 @@ do
             --genbench_do_conf_analysis \
             --genbench_no_vina \
             --time_scheduler "$SCHED" \
-            --cfg_scale "$CFG"
-        echo "Done: time_scheduler=$SCHED cfg_scale=$CFG"
+            --cfg_scale 5.0 \
+            --sigma_pocket "$sigma_pocket"
+        echo "Done: time_scheduler=$SCHED sigma_pocket=$sigma_pocket"
         echo ""
     done
 done

@@ -32,7 +32,7 @@ mkdir -p "$SCRIPT_DIR/sbatch_script/logs"
 # Conda env for TAGMol (python + torch). GenBench uses a separate interpreter via --genbench_python.
 CONDA_ENV_PATH="${CONDA_ENV_PATH:-/shared/healthinfolab/phz24002/anaconda3/envs/tagmol}"
 export PATH="$CONDA_ENV_PATH/bin:$PATH"
-export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # Optional: match cluster CUDA module if your PyTorch build expects it (uncomment if needed).
 # module load cuda/11.7

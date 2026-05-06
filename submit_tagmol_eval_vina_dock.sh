@@ -45,5 +45,8 @@ for i in $(seq 0 9); do
 done
 
 echo ""
-echo "Submitted 10 jobs. squeue -u \$USER"
-echo "Sample (results): $SAMPLE_DIR/eval_shards/shard_*/eval_results/"
+echo "Submitted 10 jobs (each \"Submitted batch job <JOBID>\" line from sbatch means success)."
+echo "Check queue:  squeue -u \"$USER\""
+echo "If squeue is empty: jobs may have finished (or failed fast). See:  sacct -S today -u \"$USER\" | head -30"
+echo "Per-job logs:   $SCRIPT_DIR/logs/eval_dock_<JOBID>.out  and  .err"
+echo "Results:        $SAMPLE_DIR/eval_shards/shard_*/eval_results/"

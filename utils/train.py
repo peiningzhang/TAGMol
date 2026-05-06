@@ -62,6 +62,13 @@ def get_optimizer(cfg, model):
             weight_decay=cfg.weight_decay,
             betas=(cfg.beta1, cfg.beta2,)
         )
+    elif cfg.type in ('adamw', 'adamW'):
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            betas=(cfg.beta1, cfg.beta2),
+        )
     elif cfg.type == 'muon':
         # Muon for hidden 2-D weight matrices + AdamW for all other params.
         # Config keys (all optional, defaults shown):

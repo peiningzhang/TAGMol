@@ -145,7 +145,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--result_path', type=str, default='./outputs')
     parser.add_argument('--checkpoint', type=str, default=None, help='Override checkpoint path')
-    parser.add_argument('--cfg_scale', type=float, default=0.0, help='Condition guidance scale; 0.0 = unconditional (no CFG), >0 enables CFG.')
+    parser.add_argument(
+        '--cfg_scale',
+        type=float,
+        default=0.0,
+        help='0.0 = null condition single forward; >0 = CFG; 1.0 = skip unconditional forward (pure cond).',
+    )
     args = parser.parse_args()
 
     logger = misc.get_logger('sampling')

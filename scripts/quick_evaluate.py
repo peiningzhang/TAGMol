@@ -1,5 +1,6 @@
 import argparse
 import glob
+import math
 import json
 import os
 import subprocess
@@ -227,7 +228,14 @@ def main():
     )
     parser.add_argument('--num_ligands_per_protein', type=int, default=10, help='Number of ligands to sample per protein.')
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size for sampling.')
-    parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale for conditioned models; 0.0 = unconditional (no CFG blend), >0 enables CFG.')
+    parser.add_argument(
+        '--cfg_scale',
+        type=float,
+        default=0.0,
+        help='For conditioned models: 0.0 = single forward with dropped condition (null); '
+             '>0 = CFG blend of cond and uncond; '
+             'cfg_scale=1.0 skips the unconditional forward (pure cond, equivalent to s=1 in CFG).',
+    )
     parser.add_argument('--cfg_strategy', type=str, default='always', choices=['always', 'half_start', 'ramp_up'],
                         help='When to apply CFG during sampling. '
                              '"always" (default): apply CFG at every denoising step. '
@@ -263,7 +271,13 @@ def main():
     parser.add_argument('--guide_scale_categ', type=float, default=0.01, help='Scale for categorical guidance.')
     parser.add_argument('--guide_kind', type=int, default=2, help='Prior kind to guide to (default=2 i.e., Kd).')
     parser.add_argument('--time_scheduler', type=str, default=None, help='Time scheduler to use, overriding config.')
-    parser.add_argument('--num_steps', type=int, default=None, help='Number of diffusion steps for sampling, overriding config.')
+    parser.add_argument(
+        '--num_steps',
+        type=int,
+        default=None,
+        help='Number of diffusion sampling steps (CLI override). If omitted: uses quick_eval.sampling_steps '
+             'in --config when set, else model.num_diffusion_timesteps from --config, else checkpoint defaults.',
+    )
     parser.add_argument(
         '--no_veda_noise_injection',
         action='store_true',
@@ -286,6 +300,14 @@ def main():
         type=float,
         default=0.0,
         help='VEDA noise injection: only when all batch sigmas are above this value (default: 0).',
+    )
+    parser.add_argument(
+        '--sigma_pocket',
+        type=float,
+        default=0.0,
+        help='Test-time isotropic Gaussian noise on protein (pocket) coordinates y: y <- y + eps, '
+             'eps ~ N(0, sigma_pocket^2 I). Angstroms; independent of sampling timestep t. '
+             '0 = default clean pocket; ~0.1-0.3 = mild; 0.5-1.0 = stress test (matches training-style pocket augmentation sense).',
     )
     parser.add_argument('--sample_config', type=str, default=None, help='Path to a yaml that defines guide_models (checkpoint, weight, gradient_scale_cord, gradient_scale_categ). Overrides --guide_checkpoints and related args.')
     # Optional: grouped SDF export + GenBench3D (off by default)
@@ -338,6 +360,8 @@ def main():
         parser.error('--run_genbench requires --gb3d_dir')
     if args.sample_only and (args.export_grouped_sdf or args.run_genbench):
         parser.error('--sample_only cannot be used with --export_grouped_sdf or --run_genbench (evaluation is skipped).')
+    if args.sigma_pocket < 0.0:
+        parser.error('--sigma_pocket must be non-negative')
 
     # Load global config (data split, seeds, etc.)
     config = misc.load_config(args.config)
@@ -363,6 +387,12 @@ def main():
     logger = misc.get_logger("quick_eval", log_dir=None)
     logger.info(f"Temporary evaluation directory: {tmp_dir}")
     logger.info("Docking protein_root (evaluate_diffusion): %s", protein_root)
+    if float(args.sigma_pocket) > 0.0:
+        logger.info(
+            "Test-time pocket perturbation (fixed sigma, not tied to sampling t): "
+            "y <- y + eps, eps ~ N(0, %.6f^2 I)  [Angstrom, all protein atoms]",
+            float(args.sigma_pocket),
+        )
 
     # Load the score (generation) model checkpoint
     ckpt = torch.load(args.checkpoint, map_location=args.device)
@@ -407,10 +437,23 @@ def main():
         model.config.time_scheduler = config.model.time_scheduler
     if hasattr(config, "model") and hasattr(config.model, "rho"):
         model.rho = config.model.rho
+    qe = getattr(config, "quick_eval", None)
+    cfg_quick_eval_steps = None
+    if qe is not None:
+        cfg_quick_eval_steps = getattr(qe, "sampling_steps", None)
+        if cfg_quick_eval_steps is None:
+            cfg_quick_eval_steps = getattr(qe, "num_sampling_steps", None)
     if args.num_steps is not None:
         model.num_timesteps = args.num_steps
+        logger.info("Sampling steps: %d (--num_steps)", model.num_timesteps)
+    elif cfg_quick_eval_steps is not None:
+        model.num_timesteps = int(cfg_quick_eval_steps)
+        logger.info("Sampling steps: %d (config.quick_eval.sampling_steps)", model.num_timesteps)
     elif hasattr(config, "model") and hasattr(config.model, "num_diffusion_timesteps"):
         model.num_timesteps = config.model.num_diffusion_timesteps
+        logger.info("Sampling steps: %d (config.model.num_diffusion_timesteps)", model.num_timesteps)
+    else:
+        logger.info("Sampling steps: %d (checkpoint / model default)", model.num_timesteps)
     if hasattr(config, "model") and hasattr(config.model, "dfm_type"):
         model.config.dfm_type = config.model.dfm_type
     if hasattr(config, "model") and hasattr(config.model, "veda_x_pred_mode"):
@@ -427,10 +470,16 @@ def main():
     logger.info("VEDA noise injection: %s", veda_noise_kwargs)
     use_condition = getattr(ckpt_cfg.model, "use_condition", False)
     if use_condition:
-        logger.info(
-            f"Model uses conditioning (use_condition=True); sampling with cfg_scale={args.cfg_scale} "
-            f"and target bins set to top tier (de novo, same as train quick eval)."
-        )
+        if math.isclose(args.cfg_scale, 1.0, rel_tol=0.0, abs_tol=1e-5):
+            logger.info(
+                "Model uses conditioning (use_condition=True); cfg_scale=1: conditional-only forward per step "
+                "(unconditional pass skipped); bins top tier (de novo, same as train quick eval)."
+            )
+        else:
+            logger.info(
+                f"Model uses conditioning (use_condition=True); sampling with cfg_scale={args.cfg_scale} "
+                f"and target bins set to top tier (de novo, same as train quick eval)."
+            )
 
     # ---------------------------------------------------------------------
     # Load guidance models (single or multiple)
@@ -485,6 +534,11 @@ def main():
     sampling_sec_per_protein = []
     for data_id in protein_indices:
         data = test_set[data_id]
+        if args.sigma_pocket > 0.0:
+            # Match training: pocket pos noise is independent of ligand sigma / timestep (see get_diffusion_loss).
+            data = data.clone()
+            sig = float(args.sigma_pocket)
+            data.protein_pos = data.protein_pos + torch.randn_like(data.protein_pos) * sig
         logger.info(f"Sampling for protein index {data_id}...")
 
         if use_condition:
@@ -557,6 +611,7 @@ def main():
 
         result = {
             'data': data,
+            'sigma_pocket': float(args.sigma_pocket),
             'pred_ligand_pos': pred_pos,
             'pred_ligand_v': pred_v,
             'pred_ligand_pos_traj': pred_pos_traj,

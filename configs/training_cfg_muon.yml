@@ -99,14 +99,14 @@ train:
   quick_eval_freq: 10000
   quick_eval_num_proteins: 10
   quick_eval_num_ligands_per_protein: 10
-  pos_noise_std: 0.3
+  pos_noise_std: 0.1
   # pocket noise vs ligand EDM sigma:
   # fixed = pos_noise_std only
   # sigma_scaled = clamp(sigma * coeff, max)
   # sigma_sqrt_scaled = clamp(sqrt(sigma) * coeff, max)
   pocket_noise_mode: sigma_scaled   # fixed | sigma_scaled | sigma_sqrt_scaled
-  pocket_noise_sigma_coeff: 0.2
-  pocket_noise_max: 1.0
+  pocket_noise_sigma_coeff: 0.1
+  pocket_noise_max: 1000
   max_grad_norm: 8.0
   optimizer:
     type: muon

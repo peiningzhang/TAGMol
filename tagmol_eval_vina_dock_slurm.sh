@@ -46,7 +46,8 @@ EXHAUSTIVENESS="${EXHAUSTIVENESS:-16}"
 CONDA_ENV_PATH="${CONDA_ENV_PATH:-/shared/healthinfolab/phz24002/anaconda3/envs/tagmol}"
 EVAL_PY="${EVAL_PY:-$CONDA_ENV_PATH/bin/python}"
 export PATH="$CONDA_ENV_PATH/bin:$PATH"
-export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+# set -u: append to PYTHONPATH only if set (Slurm jobs often have no PYTHONPATH)
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 SHARD_DIR="$SAMPLE_DIR/eval_shards/shard_${START_IDX}_${END_IDX}"
 mkdir -p "$SHARD_DIR" "$SCRIPT_DIR/logs"
